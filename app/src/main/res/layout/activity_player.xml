@@ -1,0 +1,263 @@
+<?xml version="1.0" encoding="utf-8"?>
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/rootFrame"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="#000000">
+
+    <FrameLayout
+        android:id="@+id/videoContainer"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent">
+
+        <SurfaceView
+            android:id="@+id/surfaceView"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:layout_gravity="center" />
+    </FrameLayout>
+
+    <!-- Current time, top-right corner: persistent regardless of the tap-
+         revealed controls (debugOverlay/irGrid), unlike them, toggled only by
+         the "Display current time" setting. See applyClockVisibility and the
+         debugTick Runnable (reused for its update tick) in PlayerActivity. -->
+    <TextView
+        android:id="@+id/clockView"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="top|end"
+        android:layout_margin="8dp"
+        android:background="#A0000000"
+        android:paddingStart="8dp"
+        android:paddingEnd="8dp"
+        android:paddingTop="4dp"
+        android:paddingBottom="4dp"
+        android:textColor="#FFFFFF"
+        android:fontFamily="monospace"
+        android:textSize="14sp"
+        android:visibility="gone"
+        android:text="" />
+
+    <!-- Shown only for an audio-only signal from the box (video decoding
+         never started, but audio is flowing), not while connecting or
+         reconnecting, which show just the plain black background plus the
+         debug status text instead. See the audio-only branch in runSession,
+         and initVideoCodecFromFirstFrame (which hides it again). -->
+    <ImageView
+        android:id="@+id/noVideoImage"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:background="#000000"
+        android:scaleType="fitCenter"
+        android:src="@drawable/no_video_test_card"
+        android:contentDescription="No video signal"
+        android:visibility="gone" />
+
+    <!-- Brief feedback flash for a sent IR command, independent of the
+         debugOverlay/irGrid show-on-tap controls: it should still flash
+         even while they're hidden, since it's immediate confirmation that a
+         press actually sent something. See sendIr(). -->
+    <TextView
+        android:id="@+id/irFlashView"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="top|start"
+        android:layout_margin="12dp"
+        android:textColor="#FF3B30"
+        android:textStyle="bold"
+        android:textSize="24sp"
+        android:visibility="gone"
+        android:text="" />
+
+    <!-- Pinned to the very top, above where the remote (vertically centered,
+         see irGrid below) can ever reach now that it's been shrunk; just
+         the resolution/decoder/A-V-offset text. Aspect and Settings used to
+         live here too, but at the same vertical position as the remote they
+         were unreachable behind it; both moved into the remote itself
+         (irGridContent's "app controls" block) instead. -->
+    <LinearLayout
+        android:id="@+id/debugOverlay"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_gravity="top"
+        android:orientation="horizontal"
+        android:gravity="center_vertical"
+        android:background="#A0000000"
+        android:padding="8dp"
+        android:visibility="gone">
+
+        <TextView
+            android:id="@+id/debugInfoView"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:textColor="#FFFFFF"
+            android:fontFamily="monospace"
+            android:textSize="12sp"
+            android:text="" />
+    </LinearLayout>
+
+    <!-- Full remote, replicating ABCryptobox_Remote.html's button blocks.
+         Each button's android:tag carries the IR keycode(s) exactly like the
+         HTML's value="..." attribute; a comma-separated tag (see the 555/
+         666/999 macro buttons) is sent as a sequence of keycodes rather than
+         one. PlayerActivity wires every tagged Button under irGrid generically,
+         so adding a button here needs no matching Kotlin code. The whole
+         thing is wider than any phone/tablet screen, so it lives in a
+         HorizontalScrollView for drag to pan; irGridContent (not the
+         ScrollView itself) is the one marked clickable, so a tap on a gap
+         between buttons is absorbed instead of falling through to rootFrame's
+         "tap outside controls" handling, while drags still scroll normally. -->
+    <HorizontalScrollView
+        android:id="@+id/irGrid"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="left|center_vertical"
+        android:layout_marginStart="16dp"
+        android:scrollbars="none"
+        android:visibility="gone">
+
+        <LinearLayout
+            android:id="@+id/irGridContent"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:clickable="true"
+            android:focusable="true">
+
+            <!-- Block: app controls (Settings/Aspect), stacked vertically at
+                 the very left so they're always reachable without panning,
+                 and so they no longer sit behind the top debug bar. These two
+                 are NOT IR buttons, deliberately left without an
+                 android:tag, so wireIrButtons() skips them and their own
+                 explicit click listeners (set in PlayerActivity) keep
+                 working unchanged. -->
+            <LinearLayout android:layout_width="wrap_content" android:layout_height="wrap_content"
+                android:orientation="vertical" android:layout_marginEnd="16dp">
+                <Button
+                    android:id="@+id/settingsButton"
+                    style="@style/IrButtonWideGrey"
+                    android:text="SETTINGS"
+                    android:textSize="10sp" />
+                <Button
+                    android:id="@+id/aspectButton"
+                    style="@style/IrButtonWideGrey"
+                    android:text="16:9"
+                    android:textSize="13sp" />
+                <Button
+                    android:id="@+id/quitButton"
+                    style="@style/IrButtonWideGrey"
+                    android:text="QUIT"
+                    android:textSize="12sp" />
+            </LinearLayout>
+
+            <!-- Block: power/mute merged with the nav cross into one compact
+                 3-column x 4-row grid (power, gap, mute / menu, up, exit /
+                 left, ok, right / last, down, epg), replacing the two wider
+                 separate blocks this used to be. -->
+            <GridLayout android:layout_width="wrap_content" android:layout_height="wrap_content"
+                android:layout_marginEnd="16dp" android:columnCount="3" android:rowCount="4">
+
+                <Button style="@style/IrButtonRed" android:layout_row="0" android:layout_column="0"
+                    android:tag="1" android:text="⊗" android:textSize="22sp" />
+                <Space android:layout_width="56dp" android:layout_height="56dp" android:layout_row="0" android:layout_column="1" />
+                <Button style="@style/IrButton" android:layout_row="0" android:layout_column="2"
+                    android:tag="8" android:text="MUTE" android:textSize="12sp" />
+
+                <Button style="@style/IrButton" android:layout_row="1" android:layout_column="0"
+                    android:tag="33" android:text="MENU" android:textSize="12sp" />
+                <Button style="@style/IrButton" android:layout_row="1" android:layout_column="1"
+                    android:tag="38" android:text="▲" android:textSize="22sp" />
+                <Button style="@style/IrButton" android:layout_row="1" android:layout_column="2"
+                    android:tag="36" android:text="EXIT" android:textSize="12sp" />
+
+                <Button style="@style/IrButton" android:layout_row="2" android:layout_column="0"
+                    android:tag="40" android:text="◀" android:textSize="22sp" />
+                <Button style="@style/IrButton" android:layout_row="2" android:layout_column="1"
+                    android:tag="42" android:text="OK" android:textSize="15sp" />
+                <Button style="@style/IrButton" android:layout_row="2" android:layout_column="2"
+                    android:tag="41" android:text="▶" android:textSize="22sp" />
+
+                <Button style="@style/IrButton" android:layout_row="3" android:layout_column="0"
+                    android:tag="21" android:text="LAST" android:textSize="12sp" />
+                <Button style="@style/IrButton" android:layout_row="3" android:layout_column="1"
+                    android:tag="39" android:text="▼" android:textSize="22sp" />
+                <Button style="@style/IrButton" android:layout_row="3" android:layout_column="2"
+                    android:tag="35" android:text="EPG" android:textSize="12sp" />
+            </GridLayout>
+
+            <!-- Block: info / favourites, stacked vertically to save width -->
+            <LinearLayout android:layout_width="wrap_content" android:layout_height="wrap_content"
+                android:orientation="vertical" android:layout_marginEnd="16dp">
+                <Button style="@style/IrButtonWide" android:tag="46" android:text="INFO" />
+                <Button style="@style/IrButtonWide" android:tag="63" android:text="FAV" />
+            </LinearLayout>
+
+            <!-- Block: numeric keypad -->
+            <GridLayout android:layout_width="wrap_content" android:layout_height="wrap_content"
+                android:layout_marginEnd="16dp" android:columnCount="3" android:rowCount="4">
+                <Button style="@style/IrButton" android:layout_row="0" android:layout_column="0" android:tag="9" android:text="1" />
+                <Button style="@style/IrButton" android:layout_row="0" android:layout_column="1" android:tag="10" android:text="2" />
+                <Button style="@style/IrButton" android:layout_row="0" android:layout_column="2" android:tag="11" android:text="3" />
+                <Button style="@style/IrButton" android:layout_row="1" android:layout_column="0" android:tag="12" android:text="4" />
+                <Button style="@style/IrButton" android:layout_row="1" android:layout_column="1" android:tag="13" android:text="5" />
+                <Button style="@style/IrButton" android:layout_row="1" android:layout_column="2" android:tag="14" android:text="6" />
+                <Button style="@style/IrButton" android:layout_row="2" android:layout_column="0" android:tag="15" android:text="7" />
+                <Button style="@style/IrButton" android:layout_row="2" android:layout_column="1" android:tag="16" android:text="8" />
+                <Button style="@style/IrButton" android:layout_row="2" android:layout_column="2" android:tag="17" android:text="9" />
+                <Button style="@style/IrButton" android:layout_row="3" android:layout_column="0" android:tag="44" android:text="PG+" android:textSize="12sp" />
+                <Button style="@style/IrButton" android:layout_row="3" android:layout_column="1" android:tag="18" android:text="0" />
+                <Button style="@style/IrButton" android:layout_row="3" android:layout_column="2" android:tag="43" android:text="PG-" android:textSize="12sp" />
+            </GridLayout>
+
+            <!-- Block: source / subtitles / tv-radio, the four colour keys,
+                 and transport controls stacked underneath them (moved here
+                 from being its own separate rightmost block). -->
+            <LinearLayout android:layout_width="wrap_content" android:layout_height="wrap_content"
+                android:orientation="vertical" android:layout_marginEnd="16dp">
+                <LinearLayout android:layout_width="wrap_content" android:layout_height="wrap_content" android:orientation="horizontal">
+                    <Button style="@style/IrButtonWide" android:tag="64" android:text="SAT" />
+                    <Button style="@style/IrButtonWide" android:tag="71" android:text="SUB" />
+                    <Button style="@style/IrButtonWide" android:tag="69" android:text="TV/R" />
+                </LinearLayout>
+                <LinearLayout android:layout_width="wrap_content" android:layout_height="wrap_content" android:orientation="horizontal">
+                    <Button style="@style/IrButtonWideRed" android:tag="74" android:text="FIND" />
+                    <Button style="@style/IrButtonWideGreen" android:tag="75" android:text="VMOD" />
+                    <Button style="@style/IrButtonWideYellow" android:tag="76" android:text="TXT" />
+                    <Button style="@style/IrButtonWideBlue" android:tag="77" android:text="AUDIO" />
+                </LinearLayout>
+                <GridLayout android:layout_width="wrap_content" android:layout_height="wrap_content"
+                    android:columnCount="3" android:rowCount="2">
+                    <Button style="@style/IrButton" android:layout_row="0" android:layout_column="0" android:tag="26" android:text="II" android:textSize="18sp" />
+                    <Button style="@style/IrButton" android:layout_row="0" android:layout_column="1" android:tag="27" android:text="«" android:textSize="22sp" />
+                    <Button style="@style/IrButton" android:layout_row="0" android:layout_column="2" android:tag="28" android:text="»" android:textSize="22sp" />
+                    <Button style="@style/IrButton" android:layout_row="1" android:layout_column="0" android:tag="29" android:text="●" android:textSize="22sp" android:textColor="#FF5555" />
+                    <Button style="@style/IrButton" android:layout_row="1" android:layout_column="1" android:tag="24" android:text="▶" android:textSize="22sp" />
+                    <Button style="@style/IrButton" android:layout_row="1" android:layout_column="2" android:tag="25" android:text="■" android:textSize="22sp" />
+                </GridLayout>
+            </LinearLayout>
+
+            <!-- Block: quick-channel macros (each sends several keycodes in
+                 sequence), stacked vertically to save width. -->
+            <LinearLayout android:layout_width="wrap_content" android:layout_height="wrap_content"
+                android:orientation="vertical">
+                <Button style="@style/IrButtonWide" android:tag="46,13,13,13" android:text="555" />
+                <Button style="@style/IrButtonWide" android:tag="46,14,14,14" android:text="666" />
+                <Button style="@style/IrButtonWide" android:tag="46,17,17,17,39,39" android:text="999" />
+            </LinearLayout>
+
+        </LinearLayout>
+    </HorizontalScrollView>
+
+    <TextView
+        android:id="@+id/statusView"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_gravity="bottom"
+        android:background="#A0000000"
+        android:textColor="#FFFFFF"
+        android:fontFamily="monospace"
+        android:textSize="11sp"
+        android:padding="6dp"
+        android:text="" />
+
+</FrameLayout>

@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Small persistent caption shown above a plain EditText field, since the
+         EditText's own hint disappears once a value is loaded/typed. Without
+         this, a settings screen full of saved values reads as unlabeled
+         numbers. -->
+    <style name="FieldLabel">
+        <item name="android:layout_width">wrap_content</item>
+        <item name="android:layout_height">wrap_content</item>
+        <item name="android:layout_marginTop">6dp</item>
+        <item name="android:textSize">12sp</item>
+        <item name="android:textColor">#808080</item>
+    </style>
+
+    <!-- IR remote button: transparent-ish outlined box with a label inside,
+         rather than a stock solid Android Button, so the video stays visible
+         through it. -->
+    <style name="IrButton">
+        <item name="android:layout_width">56dp</item>
+        <item name="android:layout_height">56dp</item>
+        <item name="android:layout_margin">3dp</item>
+        <item name="android:background">@drawable/ir_button_bg</item>
+        <item name="android:textColor">#FFFFFF</item>
+        <item name="android:textAllCaps">false</item>
+        <item name="android:textSize">13sp</item>
+        <item name="android:paddingStart">8dp</item>
+        <item name="android:paddingEnd">8dp</item>
+    </style>
+
+    <!-- Wider variant for multi-letter labels (MENU, EXIT, INFO, SAT...),
+         matching the reference remote's own "wide" button class. Half the
+         base horizontal padding (the text needs less clearance than a
+         square single-glyph button to begin with) plus a narrower overall
+         width than before, now that there's less padding reserved. -->
+    <style name="IrButtonWide" parent="IrButton">
+        <item name="android:layout_width">72dp</item>
+        <item name="android:paddingStart">4dp</item>
+        <item name="android:paddingEnd">4dp</item>
+    </style>
+
+    <style name="IrButtonRed" parent="IrButton">
+        <item name="android:background">@drawable/ir_button_bg_red</item>
+    </style>
+
+    <style name="IrButtonWideRed" parent="IrButtonWide">
+        <item name="android:background">@drawable/ir_button_bg_red</item>
+    </style>
+
+    <style name="IrButtonWideGreen" parent="IrButtonWide">
+        <item name="android:background">@drawable/ir_button_bg_green</item>
+    </style>
+
+    <style name="IrButtonWideYellow" parent="IrButtonWide">
+        <item name="android:background">@drawable/ir_button_bg_yellow</item>
+    </style>
+
+    <style name="IrButtonWideBlue" parent="IrButtonWide">
+        <item name="android:background">@drawable/ir_button_bg_blue</item>
+    </style>
+
+    <!-- Used for Settings/Aspect, so they read as app controls rather than
+         IR remote buttons even though they share the same shape/sizing. -->
+    <style name="IrButtonWideGrey" parent="IrButtonWide">
+        <item name="android:background">@drawable/ir_button_bg_grey</item>
+    </style>
+</resources>

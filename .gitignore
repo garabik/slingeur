@@ -1,0 +1,15 @@
+# Build outputs / caches
+*.apk
+*.aab
+/app/build/
+/build/
+/.gradle/
+/.kotlin/
+
+# Local machine config (SDK path etc.) -- never portable, never committed
+local.properties
+
+# IDE
+/.idea/
+*.iml
+.DS_Store

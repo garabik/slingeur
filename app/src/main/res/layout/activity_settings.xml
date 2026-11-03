@@ -1,0 +1,94 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:padding="12dp">
+
+        <TextView android:layout_width="wrap_content" android:layout_height="wrap_content"
+            android:textStyle="bold" android:text="Slingbox settings" />
+
+        <TextView android:layout_width="wrap_content" android:layout_height="wrap_content"
+            android:textStyle="bold" android:layout_marginTop="4dp" android:text="Video (current Slingbox)" />
+
+        <TextView android:layout_width="wrap_content" android:layout_height="wrap_content"
+            android:textStyle="bold" android:layout_marginTop="4dp" android:text="Resolution" />
+
+        <Spinner android:id="@+id/resolutionSpinner" android:layout_width="match_parent" android:layout_height="wrap_content" />
+
+        <TextView style="@style/FieldLabel" android:text="Frame rate" />
+        <EditText android:id="@+id/frameRateEdit" android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:hint="FrameRate" android:inputType="number" />
+
+        <TextView style="@style/FieldLabel" android:text="Bitrate" />
+        <EditText android:id="@+id/videoBandwidthEdit" android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:hint="VideoBandwidth (bitrate)" android:inputType="number" />
+
+        <TextView style="@style/FieldLabel" android:text="Video smoothness" />
+        <EditText android:id="@+id/videoSmoothnessEdit" android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:hint="VideoSmoothness" android:inputType="number" />
+
+        <TextView style="@style/FieldLabel" android:text="Keyframe interval (seconds)" />
+        <EditText android:id="@+id/iframeRateEdit" android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:hint="IframeRate" android:inputType="number" />
+
+        <TextView style="@style/FieldLabel" android:text="Audio bit rate" />
+        <EditText android:id="@+id/audioBitRateEdit" android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:hint="AudioBitRate" android:inputType="number" />
+
+        <TextView android:layout_width="wrap_content" android:layout_height="wrap_content"
+            android:textStyle="bold" android:layout_marginTop="12dp" android:text="Aspect ratio" />
+
+        <RadioGroup android:id="@+id/aspectRatioGroup" android:layout_width="wrap_content" android:layout_height="wrap_content"
+            android:orientation="horizontal">
+            <RadioButton android:id="@+id/aspect43" android:layout_width="wrap_content" android:layout_height="wrap_content"
+                android:text="4:3" />
+            <RadioButton android:id="@+id/aspect169" android:layout_width="wrap_content" android:layout_height="wrap_content"
+                android:layout_marginStart="16dp" android:text="16:9" />
+            <RadioButton android:id="@+id/aspectFit" android:layout_width="wrap_content" android:layout_height="wrap_content"
+                android:layout_marginStart="16dp" android:text="Fit" />
+        </RadioGroup>
+
+        <TextView android:layout_width="wrap_content" android:layout_height="wrap_content"
+            android:textStyle="bold" android:layout_marginTop="12dp" android:text="Video decoder" />
+
+        <RadioGroup android:id="@+id/videoDecoderGroup" android:layout_width="wrap_content" android:layout_height="wrap_content"
+            android:orientation="vertical">
+            <RadioButton android:id="@+id/decoderAuto" android:layout_width="wrap_content" android:layout_height="wrap_content"
+                android:text="Auto" />
+            <RadioButton android:id="@+id/decoderHardware" android:layout_width="wrap_content" android:layout_height="wrap_content"
+                android:text="Hardware" />
+            <RadioButton android:id="@+id/decoderSoftware" android:layout_width="wrap_content" android:layout_height="wrap_content"
+                android:text="Software" />
+            <RadioButton android:id="@+id/decoderLegacyOmx" android:layout_width="wrap_content" android:layout_height="wrap_content"
+                android:text="Legacy OMX (Samsung only)" />
+        </RadioGroup>
+
+        <CheckBox android:id="@+id/pacingCheck" android:layout_width="wrap_content" android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:text="Pace video to real-time" />
+
+        <CheckBox android:id="@+id/lowLatencyCheck" android:layout_width="wrap_content" android:layout_height="wrap_content"
+            android:text="Low-latency mode" />
+
+        <CheckBox android:id="@+id/fullscreenCheck" android:layout_width="wrap_content" android:layout_height="wrap_content"
+            android:text="Fullscreen" />
+
+        <CheckBox android:id="@+id/debugMessagesCheck" android:layout_width="wrap_content" android:layout_height="wrap_content"
+            android:text="Show debug messages" />
+
+        <CheckBox android:id="@+id/displayTimeCheck" android:layout_width="wrap_content" android:layout_height="wrap_content"
+            android:text="Display current time" />
+
+        <Button android:id="@+id/saveButton" android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:layout_marginTop="16dp" android:text="Save and reconnect" />
+
+        <Button android:id="@+id/disconnectButton" android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:layout_marginTop="4dp" android:text="Disconnect" android:backgroundTint="#B00020" />
+
+    </LinearLayout>
+</ScrollView>
