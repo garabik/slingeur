@@ -166,8 +166,8 @@ class SlingboxClient(
     private fun slingOpen(connectionType: String, sessionId: Int): Socket {
         val s = Socket()
         s.tcpNoDelay = true
-        s.connect(InetSocketAddress(host, port), 10_000)
-        s.soTimeout = 15_000
+        s.connect(InetSocketAddress(host, port), 15_000)
+        s.soTimeout = 20_000
         val request = "GET /stream.asf HTTP/1.1\r\nAccept: */*\r\n" +
             "Pragma: Sling-Connection-Type=$connectionType, Session-Id=$sessionId\r\n\r\n"
         s.getOutputStream().write(request.toByteArray(Charsets.US_ASCII))
@@ -494,8 +494,8 @@ class SlingboxClient(
         log("Connecting to Slinger server stream ...")
         val s = Socket()
         s.tcpNoDelay = true
-        s.connect(InetSocketAddress(host, port), 10_000)
-        s.soTimeout = 15_000
+        s.connect(InetSocketAddress(host, port), 15_000)
+        s.soTimeout = 20_000
         streamSocket = s
         val input = s.getInputStream()
         val request = "GET $path HTTP/1.1\r\nHost: $host:$port\r\nConnection: keep-alive\r\n\r\n"
