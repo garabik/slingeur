@@ -15,6 +15,11 @@ extending and testing, on and off.
 This has been tested only with Slingbox ProHD, because this is all I have
 (technically, I own also a Slingbox Solo, but without a wall adapter).
 
+Worth repeating for new users: if installing a Slinbox, make sure outgoing TCP
+port 5678 is blocked (or the Slingbox cannot reach wide internet), otherwise it
+will be intentionally bricked by Sling Media.
+
+
 The primary motivation for the development was to have a reliable client for an
 Android settop box (a cheap, unreliable and low powerered one), that is,
 working in landscape, controlled by a keyboard (or Android remote control) and
