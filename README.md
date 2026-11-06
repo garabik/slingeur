@@ -102,8 +102,8 @@ less usability. Slinger custom remotes are not supported.
 * Tab / Menu:   Open Settings
 * Zoom key / z: Cycle zoom: 2× → 3× → 4× → off
 * c:    Toggle remote/top bar (same as tapping the video)
-* long-press OK:    the same as c (toggle remote)
-* teletext key:     the same as c (toggle remote)
+* long-press OK:    the same as c (toggle remote, +navigable)
+* teletext key:     the same as c (toggle remote, +navigable)
 * a / Captions: Cycle aspect ratio (16:9, 4:3, fit screen)
 
 For limited physical remotes (such as commonly used with Android TV), you can
