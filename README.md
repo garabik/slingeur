@@ -86,7 +86,7 @@ less usability. Slinger custom remotes are not supported.
 
 * 0–9:    Number keys
 * Enter / Space / D-pad center:   OK
-* Arrow keys: Left/Right/Up/Down
+* Arrow keys: Left/Right/Up/Down (pan the picture while zoomed in)
 * Page Up / Down: Page Up/Down
 * m / M (shift):  Menu / Mute (remote)
 * g / G (shift):  Guide / Green button (vmod)
@@ -96,12 +96,21 @@ less usability. Slinger custom remotes are not supported.
 * x:    Exit
 * p:    Power
 * R / Y / B / G (uppercase, with a shift): coloured buttons (find/txt/audio/vmod)
+* Dedicated colour keys:    the same coloured buttons as above
+* Channel Up / Channel Down: channel up/down (same as the on-screen channel buttons)
 * Media keys (Play / Pause / Play-Pause / Stop / Rewind / FF / Record: Media control
 * Tab / Menu:   Open Settings
 * Zoom key / z: Cycle zoom: 2× → 3× → 4× → off
 * c:    Toggle remote/top bar (same as tapping the video)
-* a:    Cycle aspect ratio (16:9, 4:3, fit screen)
- 
+* long-press OK:    the same as c (toggle remote)
+* teletext key:     the same as c (toggle remote)
+* a / Captions: Cycle aspect ratio (16:9, 4:3, fit screen)
+
+For limited physical remotes (such as commonly used with Android TV), you can
+long-press OK (or the TELETEXT key, if there is one) to bring the on-screen
+remote up, and then use the D-pad keys and OK to navigate virtual remote
+buttons.
+
 Unmapped keys (volume, back, etc.) pass through to normal Android handling.
 Held keys don't flood the box with repeated IR sends, except panning, which
 repeats smoothly.
