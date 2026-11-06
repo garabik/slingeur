@@ -5,6 +5,8 @@ to a Slingbox, if reachable by an IP number (or DNS record); or to a
 running Gerry Dazoo's [Slinger server](https://github.com/GerryDazoo/Slinger)
 as an alternative to an existing Slinger player or `ffplay`.
 
+Current package is here: https://github.com/garabik/slingeur/releases/download/v0.99/slingeur-0.99-debug.apk
+
 
 *Warning*: this is vibe-coded, with the help of Claude Sonnet 5. Claude wrote
 all the code, based on Python implementation of Slinger server, video stream
