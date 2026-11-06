@@ -23,7 +23,7 @@ will be intentionally bricked by Sling Media.
 
 
 The primary motivation for the development was to have a reliable client for an
-Android settop box (a cheap, unreliable and low powerered one), that is,
+Android settop box (a cheap, unreliable and low powered one), that is,
 working in landscape, controlled by a keyboard (or Android remote control) and
 preferably with low latency playback. Something that my 
 [web player](https://github.com/garabik/Slinger/tree/remux-video) definitely isn't.
