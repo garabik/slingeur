@@ -21,6 +21,7 @@ import android.view.SurfaceHolder
 import android.view.SurfaceView
 import android.view.View
 import android.view.ViewConfiguration
+import android.view.ViewGroup
 import android.view.WindowInsets
 import android.view.WindowInsetsController
 import android.widget.Button
@@ -80,6 +81,7 @@ class PlayerActivity : Activity(), SurfaceHolder.Callback {
     private var irFlashHideRunnable: Runnable? = null
     private lateinit var irGrid: android.view.View
     private lateinit var rootFrame: android.view.View
+    private lateinit var irOkButton: Button
 
     @Volatile private var running = false
     private var client: SlingboxClient? = null
@@ -107,6 +109,10 @@ class PlayerActivity : Activity(), SurfaceHolder.Callback {
     private val uiHandler = Handler(Looper.getMainLooper())
     private var hideControlsRunnable: Runnable? = null
     private var debugMessagesEnabled = true
+    // Last physical key event seen by onKeyDown, shown on the debug row
+    // when debug is on -- handy for checking what keyCode a given remote
+    // button actually sends, without needing logcat.
+    private var lastKeyDebugText = ""
     private val clockFormat = java.text.SimpleDateFormat("HH:mm", java.util.Locale.getDefault())
     private val debugTick = object : Runnable {
         override fun run() {
@@ -127,8 +133,9 @@ class PlayerActivity : Activity(), SurfaceHolder.Callback {
                 lastRateSampleBytes = bytesReceivedTotal
             }
             debugInfoView.text = "%s  A/V offset %+.2fs".format(lastVideoDecoderName, avOffsetSec)
-            statusView.text = "%s   %dx%d  backlog %.0fKB  %.0f kb/s".format(
-                lastStatusMessage, lastVideoWidth, lastVideoHeight, backlogKB, lastDisplayedRateKbps
+            val keySuffix = if (debugMessagesEnabled && lastKeyDebugText.isNotEmpty()) "  $lastKeyDebugText" else ""
+            statusView.text = "%s   %dx%d  backlog %.0fKB  %.0f kb/s%s".format(
+                lastStatusMessage, lastVideoWidth, lastVideoHeight, backlogKB, lastDisplayedRateKbps, keySuffix
             )
             if (clockView.visibility == android.view.View.VISIBLE) {
                 clockView.text = clockFormat.format(java.util.Date())
@@ -200,6 +207,18 @@ class PlayerActivity : Activity(), SurfaceHolder.Callback {
         irFlashView = findViewById(R.id.irFlashView)
         clockView = findViewById(R.id.clockView)
         irGrid = findViewById(R.id.irGrid)
+        // Default: the remote's buttons are NOT reachable by D-pad focus-
+        // search at all, even while visible -- this is what keeps a stock
+        // Android device's physical/HW keyboard working exactly as before
+        // (arrow keys sending IR nav codes, letters sending their own IR
+        // codes, etc.) while the remote happens to be on-screen, since
+        // without this, simply having the remote visible would let Android's
+        // own focus-search jump an arrow key into a button instead of
+        // reaching onKeyDown at all. Only long-pressing OK (see
+        // onKeyLongPress) switches this to FOCUS_BEFORE_DESCENDANTS for a
+        // genuine D-pad-only remote (Android TV) that has no other way to
+        // reach most buttons.
+        (irGrid as ViewGroup).descendantFocusability = ViewGroup.FOCUS_BLOCK_DESCENDANTS
         // irGrid is now a HorizontalScrollView (the remote is wider than any
         // screen), so it must NOT get a blanket "always consume" touch
         // listener like before -- that would swallow the drag gesture the
@@ -218,6 +237,10 @@ class PlayerActivity : Activity(), SurfaceHolder.Callback {
             false
         }
         rootFrame = findViewById(R.id.rootFrame)
+        // A stable, always-present focus target to hand D-pad focus back to
+        // whenever the remote hides -- see showControls/hideControls.
+        rootFrame.isFocusable = true
+        irOkButton = findViewById(R.id.irOkButton)
         applyAspectRatio()
         applyDebugVisibility()
         applyClockVisibility()
@@ -306,6 +329,12 @@ class PlayerActivity : Activity(), SurfaceHolder.Callback {
             KeyEvent.KEYCODE_R -> if (shift) 74 else null // Find (red)
             KeyEvent.KEYCODE_Y -> if (shift) 76 else null // Txt (yellow)
             KeyEvent.KEYCODE_B -> if (shift) 77 else null // Audio (blue)
+            // Dedicated colour keys some remotes have alongside (or instead
+            // of) the shifted letters above -- same codes either way.
+            KeyEvent.KEYCODE_PROG_RED -> 74
+            KeyEvent.KEYCODE_PROG_GREEN -> 75
+            KeyEvent.KEYCODE_PROG_YELLOW -> 76
+            KeyEvent.KEYCODE_PROG_BLUE -> 77
             // Standard Android/Bluetooth media keys -> the same transport-
             // controls codes the on-screen remote block uses.
             KeyEvent.KEYCODE_MEDIA_PLAY -> 24
@@ -323,6 +352,7 @@ class PlayerActivity : Activity(), SurfaceHolder.Callback {
     }
 
     override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
+        lastKeyDebugText = "key ${KeyEvent.keyCodeToString(keyCode).removePrefix("KEYCODE_")} ($keyCode)"
         // Checked before the repeatCount==0 gate below (unlike everything
         // else in this method) so holding an arrow key pans smoothly via the
         // system's own key auto-repeat, instead of requiring a fresh press
@@ -368,17 +398,79 @@ class PlayerActivity : Activity(), SurfaceHolder.Callback {
                 onTap()
                 return true
             }
-            if (keyCode == KeyEvent.KEYCODE_A) {
+            // TV_TELETEXT also brings the remote up, but in D-pad-navigable
+            // mode (same as long-pressing OK -- see onLongPressShowRemote)
+            // rather than plain onTap()'s mode: on hardware where long-press
+            // detection doesn't fire reliably, this is the only other
+            // reachable way to get a navigable remote.
+            if (keyCode == KeyEvent.KEYCODE_TV_TELETEXT) {
+                onLongPressShowRemote()
+                return true
+            }
+            if (keyCode == KeyEvent.KEYCODE_A || keyCode == KeyEvent.KEYCODE_CAPTIONS) {
                 cycleAspectRatio()
                 return true
             }
-            val code = irCodeForKeyEvent(event)
-            if (code != null) {
-                sendIr(code.toString())
+            // Dedicated channel keys some remotes have, same as the on-screen
+            // remote's own quick-channel buttons (see nextChannel/previousChannel).
+            if (keyCode == KeyEvent.KEYCODE_CHANNEL_UP) {
+                nextChannel()
                 return true
+            }
+            if (keyCode == KeyEvent.KEYCODE_CHANNEL_DOWN) {
+                previousChannel()
+                return true
+            }
+            // While the on-screen remote is up in D-pad-navigable mode (see
+            // showControls/onLongPressShowRemote), D-pad/OK presses are
+            // meant to move focus between its buttons / click the focused
+            // one -- not also fire the same codes as IR commands behind the
+            // scenes. Leaving this unconsumed here lets super.onKeyDown()
+            // (and whichever Button currently has focus) handle it instead.
+            val isDpadNavKey = keyCode == KeyEvent.KEYCODE_DPAD_UP || keyCode == KeyEvent.KEYCODE_DPAD_DOWN ||
+                keyCode == KeyEvent.KEYCODE_DPAD_LEFT || keyCode == KeyEvent.KEYCODE_DPAD_RIGHT ||
+                keyCode == KeyEvent.KEYCODE_DPAD_CENTER || keyCode == KeyEvent.KEYCODE_ENTER
+            if (!(isDpadNavKey && remoteIsDpadNavigable())) {
+                val code = irCodeForKeyEvent(event)
+                if (code != null) {
+                    // DPAD_CENTER/ENTER send their short-press OK code
+                    // immediately here either way, but also need to arm the
+                    // framework's own long-press tracking (see
+                    // onKeyLongPress) -- returning true without calling
+                    // startTracking() on the initial down event would
+                    // otherwise leave the long-press timeout permanently
+                    // unarmed, since KeyEvent.dispatch() only starts
+                    // tracking a key when the handler that consumed its
+                    // first down event explicitly asked it to.
+                    if (keyCode == KeyEvent.KEYCODE_DPAD_CENTER || keyCode == KeyEvent.KEYCODE_ENTER) {
+                        event.startTracking()
+                    }
+                    sendIr(code.toString())
+                    return true
+                }
             }
         }
         return super.onKeyDown(keyCode, event)
+    }
+
+    private fun remoteIsDpadNavigable(): Boolean =
+        irGrid.visibility == android.view.View.VISIBLE &&
+            (irGrid as ViewGroup).descendantFocusability == ViewGroup.FOCUS_BEFORE_DESCENDANTS
+
+    // Long-pressing OK brings the remote forward -- an easy, always-present
+    // way to do that on an Android TV remote, which typically has only a
+    // D-pad, OK, Back, Home and a numeric keypad, none of the other keys
+    // this app maps (letters, Tab, c, etc.) on a full keyboard. A short
+    // press still sends the box's own OK code immediately either way (see
+    // onKeyDown above); this just additionally triggers once the system's
+    // own long-press timer fires if the key is held, same as a long-press
+    // on Home/Back elsewhere in Android.
+    override fun onKeyLongPress(keyCode: Int, event: KeyEvent): Boolean {
+        if (keyCode == KeyEvent.KEYCODE_DPAD_CENTER || keyCode == KeyEvent.KEYCODE_ENTER) {
+            onLongPressShowRemote()
+            return true
+        }
+        return super.onKeyLongPress(keyCode, event)
     }
 
     // Cycles 2x -> 3x -> 4x -> back to unzoomed, picking the next step up
@@ -454,11 +546,36 @@ class PlayerActivity : Activity(), SurfaceHolder.Callback {
     // follows the "Show debug messages" setting instead of disappearing
     // outright: on means it stays up permanently, off means it only shows
     // with the rest of the controls. See applyDebugVisibility/hideControls.
-    private fun showControls() {
+    // dpadFocus=true (only from long-pressing OK -- see onKeyLongPress)
+    // switches the remote into a genuinely D-pad-navigable mode: the buttons
+    // become reachable by focus-search and OK starts focused. Everywhere
+    // else that shows the remote (tap, 'c', zoom key, etc.) leaves it false,
+    // which keeps a stock device's physical/HW keyboard working exactly as
+    // before while the remote happens to be visible, since
+    // FOCUS_BLOCK_DESCENDANTS (set in onCreate, restored on hide below)
+    // means the remote's buttons simply aren't focus-search candidates at
+    // all in that case -- arrow keys/letters still reach onKeyDown.
+    private fun showControls(dpadFocus: Boolean = false) {
         irGrid.visibility = android.view.View.VISIBLE
         debugOverlay.visibility = android.view.View.VISIBLE
         syncStatusVisibility()
+        if (dpadFocus) {
+            (irGrid as ViewGroup).descendantFocusability = ViewGroup.FOCUS_BEFORE_DESCENDANTS
+            irOkButton.requestFocus()
+        }
         scheduleHideControls()
+    }
+
+    // Called by the framework for every key/touch event dispatched to this
+    // Activity, consumed or not -- including D-pad focus navigation between
+    // remote buttons and OK-clicking a focused one, both of which are
+    // consumed entirely by the focused Button itself (via its own built-in
+    // key handling) and so never reach onKeyDown/onTap at all. Without this,
+    // navigating the D-pad-mode remote (see showControls/onKeyLongPress)
+    // would let it auto-hide out from under an otherwise-active user.
+    override fun onUserInteraction() {
+        super.onUserInteraction()
+        if (irGrid.visibility == android.view.View.VISIBLE) scheduleHideControls()
     }
 
     // Restarts the 5-second auto-hide countdown without touching visibility,
@@ -468,6 +585,15 @@ class PlayerActivity : Activity(), SurfaceHolder.Callback {
     private fun scheduleHideControls() {
         hideControlsRunnable?.let { uiHandler.removeCallbacks(it) }
         val r = Runnable {
+            // Move focus off whatever remote button has it first (only ever
+            // applicable if this was shown in D-pad mode) -- a focused view
+            // becoming GONE gets reassigned somewhere by Android regardless,
+            // but to somewhere unpredictable; rootFrame is a stable,
+            // always-present fallback. Also restores the safe default of
+            // blocking the remote's buttons from focus-search entirely,
+            // whether or not this particular show was in D-pad mode.
+            rootFrame.requestFocus()
+            (irGrid as ViewGroup).descendantFocusability = ViewGroup.FOCUS_BLOCK_DESCENDANTS
             irGrid.visibility = android.view.View.GONE
             debugOverlay.visibility = android.view.View.GONE
             syncStatusVisibility()
@@ -478,6 +604,8 @@ class PlayerActivity : Activity(), SurfaceHolder.Callback {
 
     private fun hideControls() {
         hideControlsRunnable?.let { uiHandler.removeCallbacks(it) }
+        rootFrame.requestFocus()
+        (irGrid as ViewGroup).descendantFocusability = ViewGroup.FOCUS_BLOCK_DESCENDANTS
         irGrid.visibility = android.view.View.GONE
         debugOverlay.visibility = android.view.View.GONE
         syncStatusVisibility()
@@ -856,6 +984,19 @@ class PlayerActivity : Activity(), SurfaceHolder.Callback {
             hideControls()
         } else {
             showControls()
+        }
+    }
+
+    // Same show/hide toggle as onTap(), but for the long-press-OK trigger
+    // (see onKeyLongPress): shows the remote in D-pad-navigable mode, since
+    // that's the one case (TV remote with no other way to reach most
+    // buttons) where grabbing focus is actually wanted.
+    private fun onLongPressShowRemote() {
+        resyncRequested = true
+        if (debugOverlay.visibility == android.view.View.VISIBLE) {
+            hideControls()
+        } else {
+            showControls(dpadFocus = true)
         }
     }
 
