@@ -5,7 +5,7 @@ to a Slingbox, if reachable by an IP number (or DNS record); or to a
 running Gerry Dazoo's [Slinger server](https://github.com/GerryDazoo/Slinger)
 as an alternative to an existing Slinger player or `ffplay`.
 
-Current package is here: https://github.com/garabik/slingeur/releases/download/v0.99/slingeur-0.99-debug.apk
+Current package is here: https://github.com/garabik/slingeur/releases/download/v1.0/slingeur-1.0-debug.apk
 
 
 *Warning*: this is vibe-coded, with the help of Claude Sonnet 5. Claude wrote
@@ -28,7 +28,9 @@ working in landscape, controlled by a keyboard (or Android remote control) and
 preferably with low latency playback. Something that my 
 [web player](https://github.com/garabik/Slinger/tree/remux-video) definitely isn't.
 
-But it has also some nice features for handheld devices with a touchscreen, such as remote-on-tap, pinch-zoom&pan, volume control by sliding a finger on the right border, brightness control by sliding a finger on the left border.
+But it has also some nice features for handheld devices with a touchscreen,
+such as remote-on-tap, pinch-zoom&pan, volume control by sliding a finger on
+the right border, brightness control by sliding a finger on the left border.
 
 Native Android Slingbox client (Kotlin, direct `MediaCodec`, no ExoPlayer) —
 talks to a Slingbox (Solo/Pro/ProHD, or 350/500/M1/M2/240) directly over its
@@ -116,4 +118,14 @@ Held keys don't flood the box with repeated IR sends, except panning, which
 repeats smoothly.
 
 Keyboard mapping is hardwired in `app/src/main/java/app/retro/slingeur/PlayerActivity.kt`
+
+## Settings
+
+Some of the settings explained:
+
+* **Resolution**: 640×480 is the maximum supported on ProHD; to go further, you need Slingbox 350 etc. (untested)
+* **Video decoder**: use Auto or Hardware, unless you have problems
+* **Buffer size**: size of playback buffer, in video frames. Set to 0 for low latency and very stable network connection; a small number (2 or 3) is recommended.
+* **Pace video to real time**: keep enabled, unless you want the lowest possible latency. If disabled, the frames are played as soon as they arrive, which results in stuttering and audio/video desync.
+* **Low latency mode**: instruct Android decoder to use low-latency mode, if available. Keep on, unless you have audio/video sync or other problems.
 
