@@ -156,6 +156,7 @@ object AppSettings {
     private const val KEY_ASPECT_RATIO = "aspectRatio" // "16:9" or "4:3"
     private const val KEY_VIDEO_DECODER = "videoDecoder" // "auto", "hardware", or "software"
     private const val KEY_PACING_ENABLED = "pacingEnabled"
+    private const val KEY_BUFFER_FRAMES = "bufferFrames"
     private const val KEY_LOW_LATENCY_HINT = "lowLatencyHint"
     private const val KEY_FULLSCREEN_ENABLED = "fullscreenEnabled"
     private const val KEY_DEBUG_MESSAGES_ENABLED = "debugMessagesEnabled"
@@ -179,6 +180,9 @@ object AppSettings {
         val aspectRatio: String,
         val videoDecoder: String,
         val pacingEnabled: Boolean,
+        // Deliberate playback-cushion depth, in frames, used only while
+        // pacingEnabled -- see VideoPacer's own field comment.
+        val bufferFrames: Int,
         val lowLatencyHint: Boolean,
         val fullscreenEnabled: Boolean,
         val debugMessagesEnabled: Boolean,
@@ -203,6 +207,7 @@ object AppSettings {
             aspectRatio = p.getString(KEY_ASPECT_RATIO, "16:9") ?: "16:9",
             videoDecoder = p.getString(KEY_VIDEO_DECODER, "auto") ?: "auto",
             pacingEnabled = p.getBoolean(KEY_PACING_ENABLED, true),
+            bufferFrames = p.getInt(KEY_BUFFER_FRAMES, 2),
             lowLatencyHint = p.getBoolean(KEY_LOW_LATENCY_HINT, true),
             fullscreenEnabled = p.getBoolean(KEY_FULLSCREEN_ENABLED, true),
             debugMessagesEnabled = p.getBoolean(KEY_DEBUG_MESSAGES_ENABLED, true),
@@ -220,6 +225,7 @@ object AppSettings {
             .putString(KEY_ASPECT_RATIO, s.aspectRatio)
             .putString(KEY_VIDEO_DECODER, s.videoDecoder)
             .putBoolean(KEY_PACING_ENABLED, s.pacingEnabled)
+            .putInt(KEY_BUFFER_FRAMES, s.bufferFrames)
             .putBoolean(KEY_LOW_LATENCY_HINT, s.lowLatencyHint)
             .putBoolean(KEY_FULLSCREEN_ENABLED, s.fullscreenEnabled)
             .putBoolean(KEY_DEBUG_MESSAGES_ENABLED, s.debugMessagesEnabled)

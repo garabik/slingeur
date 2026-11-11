@@ -32,6 +32,7 @@ class SettingsActivity : Activity() {
     private lateinit var decoderSoftware: RadioButton
     private lateinit var decoderLegacyOmx: RadioButton
     private lateinit var pacingCheck: CheckBox
+    private lateinit var bufferFramesEdit: EditText
     private lateinit var lowLatencyCheck: CheckBox
     private lateinit var fullscreenCheck: CheckBox
     private lateinit var debugMessagesCheck: CheckBox
@@ -60,6 +61,7 @@ class SettingsActivity : Activity() {
         decoderSoftware = findViewById(R.id.decoderSoftware)
         decoderLegacyOmx = findViewById(R.id.decoderLegacyOmx)
         pacingCheck = findViewById(R.id.pacingCheck)
+        bufferFramesEdit = findViewById(R.id.bufferFramesEdit)
         lowLatencyCheck = findViewById(R.id.lowLatencyCheck)
         fullscreenCheck = findViewById(R.id.fullscreenCheck)
         debugMessagesCheck = findViewById(R.id.debugMessagesCheck)
@@ -84,6 +86,7 @@ class SettingsActivity : Activity() {
             else -> decoderAuto.isChecked = true
         }
         pacingCheck.isChecked = s.pacingEnabled
+        bufferFramesEdit.setText(s.bufferFrames.toString())
         lowLatencyCheck.isChecked = s.lowLatencyHint
         fullscreenCheck.isChecked = s.fullscreenEnabled
         debugMessagesCheck.isChecked = s.debugMessagesEnabled
@@ -139,6 +142,7 @@ class SettingsActivity : Activity() {
                 else -> "auto"
             },
             pacingEnabled = pacingCheck.isChecked,
+            bufferFrames = intOf(bufferFramesEdit, 2),
             lowLatencyHint = lowLatencyCheck.isChecked,
             fullscreenEnabled = fullscreenCheck.isChecked,
             debugMessagesEnabled = debugMessagesCheck.isChecked,

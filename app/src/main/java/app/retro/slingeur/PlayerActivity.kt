@@ -31,15 +31,16 @@ import android.widget.TextView
 import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer
 import java.util.concurrent.LinkedBlockingDeque
+import java.util.concurrent.PriorityBlockingQueue
 
 /**
  * Real-time low-latency player: logs into the Slingbox (same session setup as
  * [MainActivity]'s capture mode), then demuxes the decrypted ASF data packets by
  * Stream Number and feeds H.264 Annex-B frames / raw AAC frames straight into
- * MediaCodec -- no MediaExtractor, no container remux, no ExoPlayer. Video
- * normally paces to a steady per-frame clock (see [VideoPacer]); audio is
- * written to an AudioTrack as soon as each frame decodes, unpaced (its own
- * blocking writes provide natural pacing).
+ * MediaCodec -- no MediaExtractor, no container remux, no ExoPlayer. Both audio
+ * and video normally pace through one shared queue against the box's own real
+ * timestamps (see [MediaPacer]), so the deliberate buffer cushion delays both
+ * streams by exactly the same amount and can never itself skew them apart.
  *
  * The AAC config is synthesized from the header's real sample-rate/channel
  * fields rather than the box's own WAVEFORMATEX extra-data bytes, which were
@@ -93,13 +94,13 @@ class PlayerActivity : Activity(), SurfaceHolder.Callback {
     private var audioTrack: AudioTrack? = null
     private var videoPump: CodecInputPump? = null
     private var audioPump: CodecInputPump? = null
-    private var videoPacer: VideoPacer? = null
+    private var mediaPacer: MediaPacer? = null
     // Separate HandlerThreads for video vs audio MediaCodec callbacks -- AudioTrack.write()
     // in the audio output callback blocks when the hardware buffer is full, and sharing one
     // thread meant that could stall video's onInputBufferAvailable/onOutputBufferAvailable
     // callbacks too. That's a plausible cause of decode corruption that scales with frame
     // size/resolution (bigger video frames = more callback work = more chances to collide
-    // with an audio stall) and is completely unaffected by VideoPacer's on/off state, which
+    // with an audio stall) and is completely unaffected by MediaPacer's on/off state, which
     // matches it being ruled out as a factor.
     private var videoCodecThread: HandlerThread? = null
     private var videoCodecHandler: Handler? = null
@@ -113,11 +114,22 @@ class PlayerActivity : Activity(), SurfaceHolder.Callback {
     // when debug is on -- handy for checking what keyCode a given remote
     // button actually sends, without needing logcat.
     private var lastKeyDebugText = ""
+    // Set (to the current time) by doResync() every time it runs, whether or
+    // not it actually found a key frame to jump to -- shown as a brief flash
+    // on the debug row (see debugTick) rather than left permanently, so it
+    // reads as "a resync just happened" rather than a stuck/confusing label.
+    @Volatile private var lastResyncAtMs = 0L
+    // Which of doResync()'s two paths last ran -- "skip to keyframe" (found
+    // one buffered, jumped to it) or "draining" (none buffered, fast-
+    // draining the queue instead -- see fastDrainBuffer). Shown alongside
+    // lastResyncAtMs rather than a generic "resync" label, since the two
+    // mean quite different things (see PlayerActivity's own doResync()).
+    @Volatile private var lastResyncKind = ""
     private val clockFormat = java.text.SimpleDateFormat("HH:mm", java.util.Locale.getDefault())
     private val debugTick = object : Runnable {
         override fun run() {
-            val avOffsetSec = (videoPacer?.avOffsetUs ?: 0L) / 1_000_000.0
-            val backlogKB = (videoPacer?.queueBytes ?: 0L) / 1024.0
+            val avOffsetSec = (mediaPacer?.avOffsetUs ?: 0L) / 1_000_000.0
+            val backlogKB = (mediaPacer?.queueBytes ?: 0L) / 1024.0
             val now = System.currentTimeMillis()
             // Only re-sampled once a full second has actually elapsed (ticks
             // in between just keep showing the last computed value), so this
@@ -132,10 +144,11 @@ class PlayerActivity : Activity(), SurfaceHolder.Callback {
                 lastRateSampleAt = now
                 lastRateSampleBytes = bytesReceivedTotal
             }
-            debugInfoView.text = "%s  A/V offset %+.2fs".format(lastVideoDecoderName, avOffsetSec)
+            debugInfoView.text = lastVideoDecoderName
             val keySuffix = if (debugMessagesEnabled && lastKeyDebugText.isNotEmpty()) "  $lastKeyDebugText" else ""
-            statusView.text = "%s   %dx%d  backlog %.0fKB  %.0f kb/s%s".format(
-                lastStatusMessage, lastVideoWidth, lastVideoHeight, backlogKB, lastDisplayedRateKbps, keySuffix
+            val resyncSuffix = if (debugMessagesEnabled && now - lastResyncAtMs < 2000) "  $lastResyncKind" else ""
+            statusView.text = "%s   %dx%d  backlog %.0fKB  %.0f kb/s  A/V offset %+.2fs%s%s".format(
+                lastStatusMessage, lastVideoWidth, lastVideoHeight, backlogKB, lastDisplayedRateKbps, avOffsetSec, keySuffix, resyncSuffix
             )
             if (clockView.visibility == android.view.View.VISIBLE) {
                 clockView.text = clockFormat.format(java.util.Date())
@@ -1132,7 +1145,7 @@ class PlayerActivity : Activity(), SurfaceHolder.Callback {
         lastDisplayedRateKbps = 0.0
         runOnUiThread { noVideoImage.visibility = android.view.View.GONE; syncStatusVisibility() }
         keepAliveThread?.interrupt()
-        videoPacer?.shutdown()
+        mediaPacer?.shutdown()
 
         try { videoCodec?.stop() } catch (_: Exception) {}
         try { videoCodec?.release() } catch (_: Exception) {}
@@ -1165,7 +1178,7 @@ class PlayerActivity : Activity(), SurfaceHolder.Callback {
         audioTrack = null
         videoPump = null
         audioPump = null
-        videoPacer = null
+        mediaPacer = null
         videoCodecThread = null
         videoCodecHandler = null
         audioCodecThread = null
@@ -1231,22 +1244,21 @@ class PlayerActivity : Activity(), SurfaceHolder.Callback {
         audioCodec!!.start()
 
         val frameIntervalUs = 1_000_000L / s.frameRate.coerceAtLeast(1)
-        // Sync video to the audio hardware's actual playback position instead of a
-        // free-running wall clock: getPlaybackHeadPosition() counts frames actually
-        // rendered, so it already reflects decode/buffering latency and drifts with
-        // the real output device rather than this thread's own clock. Video then
-        // simply targets "whatever audio is presenting right now" every frame -- if
-        // it's behind, the wait comes out <= 0 and the frame goes out immediately,
-        // which corrects ordinary drift with no extra bookkeeping. A real network
-        // stall is different (neither stream gets new data, so there's nothing to
-        // "catch up" to yet) -- onBacklogExceeded fires once the queued backlog
-        // passes the pacer's threshold, triggering the same resync a tap would, to
-        // recover that latency instead of just playing through it.
-        val audioClockUs: () -> Long = { (audioTrack?.playbackHeadPosition ?: 0).toLong() * 1_000_000L / aRate }
-        val pacer = VideoPacer(frameIntervalUs, audioClockUs, onBacklogExceeded = { resyncRequested = true }) {
-            bytes -> videoPump?.submit(PendingFrame(bytes))
-        }
-        videoPacer = pacer
+        // Both audio and video pace through this one shared queue, against
+        // the box's own real timestamps and one shared wall-clock anchor --
+        // see MediaPacer's own class doc for why (in short: a buffer
+        // cushion applied to only one of the two streams delays that stream
+        // relative to the other, which is exactly backwards for something
+        // that's supposed to just absorb jitter). cushionUs is expressed as
+        // a frame count in the Settings UI (bufferFrames) purely because
+        // that's a more intuitive unit for users already thinking in frame
+        // rates; it's just a plain duration from here on.
+        val cushionUs = s.bufferFrames.coerceAtLeast(0) * frameIntervalUs
+        val pacer = MediaPacer(cushionUs, onBacklogExceeded = { resyncRequested = true },
+            onVideoSubmit = { bytes -> videoPump?.submit(PendingFrame(bytes)) },
+            onAudioSubmit = { bytes -> audioPump?.submit(PendingFrame(bytes)) }
+        )
+        mediaPacer = pacer
 
         keepAliveThread = Thread {
             try {
@@ -1268,6 +1280,11 @@ class PlayerActivity : Activity(), SurfaceHolder.Callback {
 
         val videoAccum = ByteArrayOutputStream()
         val audioAccum = ByteArrayOutputStream()
+        // The box's own real presentation time (ms) for whatever chunk is
+        // currently accumulating in videoAccum/audioAccum -- see their
+        // capture points below (mediaObjectOffset == 0) and MediaPacer.submit().
+        var videoFrameTimeMs = -1L
+        var audioFrameTimeMs = -1L
         var videoStarted = false
         var requireKeyFrameToStart = true
         var videoCodecReady = false
@@ -1288,12 +1305,23 @@ class PlayerActivity : Activity(), SurfaceHolder.Callback {
 
         // Diagnostic escape hatch (Settings): with pacing off, frames go straight to
         // the codec as soon as they're reassembled, for isolating decode issues from
-        // VideoPacer's real-time scheduling.
-        fun submitVideoFrame(bytes: ByteArray, isKeyFrame: Boolean) {
+        // MediaPacer's real-time scheduling.
+        fun submitVideoFrame(bytes: ByteArray, isKeyFrame: Boolean, boxTimeMs: Long) {
             if (s.pacingEnabled) {
-                pacer.submit(bytes, isKeyFrame)
+                pacer.submitVideo(bytes, isKeyFrame, boxTimeMs)
             } else {
                 videoPump?.submit(PendingFrame(bytes))
+            }
+        }
+
+        // Audio side of the same escape hatch -- symmetric with
+        // submitVideoFrame, since audio now paces through the same shared
+        // queue rather than going straight to the decoder unpaced.
+        fun submitAudioFrame(bytes: ByteArray, boxTimeMs: Long) {
+            if (s.pacingEnabled) {
+                pacer.submitAudio(bytes, boxTimeMs)
+            } else {
+                audioPump?.submit(PendingFrame(bytes))
             }
         }
 
@@ -1339,7 +1367,7 @@ class PlayerActivity : Activity(), SurfaceHolder.Callback {
             return true
         }
 
-        fun handleCompleteVideoFrame(frameBytes: ByteArray) {
+        fun handleCompleteVideoFrame(frameBytes: ByteArray, boxTimeMs: Long) {
             val splitNals = splitAnnexBNals(frameBytes)
             val isKeyFrame = splitNals.any { it.first == 5 }
             if (!videoCodecReady) {
@@ -1357,7 +1385,7 @@ class PlayerActivity : Activity(), SurfaceHolder.Callback {
             // be the exact "parameter set appears mid-stream" case the
             // stripping exists to avoid.
             val toSend = buildAnnexB(splitNals, excludeTypes = setOf(7, 8))
-            if (toSend.isNotEmpty()) submitVideoFrame(toSend, isKeyFrame)
+            if (toSend.isNotEmpty()) submitVideoFrame(toSend, isKeyFrame, boxTimeMs)
         }
 
         // Tap-to-resync: jump to the latest key frame already sitting in the
@@ -1368,11 +1396,30 @@ class PlayerActivity : Activity(), SurfaceHolder.Callback {
         // to a full key-frame interval and was needless disruption for a tap
         // that has nothing to actually jump to.
         fun doResync() {
-            if (!pacer.dropToLatestKeyFrameIfBuffered()) return
+            lastResyncAtMs = System.currentTimeMillis()
+            if (!pacer.dropToLatestKeyFrameIfBuffered()) {
+                // Nothing to jump to -- still worth draining the deliberate
+                // buffer cushion (see MediaPacer's cushionUs) quickly rather
+                // than doing nothing, so a tap/keypress resync recovers that
+                // added latency even without a key frame to jump ahead to.
+                // Nothing is dropped, so this is safe even with no buffer
+                // configured (cushionUs=0) or pacing off (pacer unused).
+                lastResyncKind = "draining"
+                pacer.fastDrainBuffer()
+                return
+            }
+            lastResyncKind = "skip to keyframe"
             videoAccum.reset()
             audioAccum.reset()
             videoPump?.clear()
             audioPump?.clear()
+            // Discards whatever already-decoded audio is still sitting in
+            // the AudioTrack's own hardware buffer from before the jump --
+            // a separate, later stage than audioPump?.clear() above (which
+            // only discards not-yet-decoded input). Harmless now regardless
+            // of AudioTrack.flush()'s exact getPlaybackHeadPosition()
+            // behavior across devices, unlike before this pacer stopped
+            // depending on that position for scheduling at all.
             try {
                 audioTrack?.flush()
             } catch (_: Exception) {
@@ -1422,9 +1469,15 @@ class PlayerActivity : Activity(), SurfaceHolder.Callback {
                             // access units before handing them to the pacer/codec.
                             if (e.mediaObjectOffset == 0) {
                                 if (videoAccum.size() > 0) {
-                                    handleCompleteVideoFrame(videoAccum.toByteArray())
+                                    handleCompleteVideoFrame(videoAccum.toByteArray(), videoFrameTimeMs)
                                     videoAccum.reset()
                                 }
+                                // The box's own timestamp for the frame that's about to
+                                // start accumulating -- captured here (its first
+                                // fragment), not when the frame completes, since the
+                                // *next* mediaObjectOffset==0 entry is what signals
+                                // completion of THIS one.
+                                videoFrameTimeMs = e.packetTimeMs
                                 if (!videoStarted) {
                                     if (!requireKeyFrameToStart || e.keyFrame) {
                                         videoStarted = true
@@ -1453,9 +1506,13 @@ class PlayerActivity : Activity(), SurfaceHolder.Callback {
                             }
                             if (e.mediaObjectOffset == 0) {
                                 if (audioAccum.size() > 0) {
-                                    audioPump?.submit(PendingFrame(audioAccum.toByteArray()))
+                                    submitAudioFrame(audioAccum.toByteArray(), audioFrameTimeMs)
                                     audioAccum.reset()
                                 }
+                                // Same capture point as videoFrameTimeMs -- the box's own
+                                // timestamp for the chunk about to start accumulating, not
+                                // the one that just completed.
+                                audioFrameTimeMs = e.packetTimeMs
                             }
                             audioAccum.write(e.payload)
                         }
@@ -1835,113 +1892,209 @@ private class CodecInputPump(private val codec: MediaCodec) {
 }
 
 /**
- * Paces video frames to the real audio clock instead of submitting them to
- * the decoder as fast as they're demuxed. Each frame targets "whatever audio
- * is presenting right now" rather than a free-running wall clock --
- * [audioClockUs] (getPlaybackHeadPosition() converted to microseconds) counts
- * frames actually rendered by the audio HAL, so it already reflects
- * decode/buffer latency and tracks the real output device's clock. A genuine
- * master/slave A/V sync, not two independently-paced streams that happen to
- * start together. If video falls behind, the computed wait is <= 0 and the
- * frame goes out immediately: that single check both detects and corrects
- * drift, every frame, with no separate smoothing needed.
+ * Paces BOTH audio and video through one shared FIFO queue against one
+ * shared wall-clock anchor, instead of the earlier design where only video
+ * was paced (against the audio hardware's own live playback position) and
+ * audio was written to its decoder completely unpaced. That asymmetry
+ * turned out to be a real bug, not just an implementation detail: applying
+ * a deliberate buffer cushion to only one of the two streams delays that
+ * stream relative to the other -- exactly backwards for something that's
+ * supposed to only absorb jitter, confirmed in practice as audio ending up
+ * consistently ahead of video by roughly the cushion's own size. Pacing
+ * both through the same queue against the same anchor means the cushion
+ * can only ever delay both streams by the same amount (a uniform
+ * startup/jitter-absorption delay, same as any streaming player's initial
+ * buffering), never skew them apart from each other.
  *
- * That self-correction handles *drift* (small, continuous clock-rate
- * mismatches) but not an actual network stall: during a stall neither stream
- * gets new data, so there's no "video behind audio" to correct -- both are
- * equally starved together. Once the stall clears and a burst of backlog
- * arrives, pacing it out at the normal rate would just make the resulting
- * extra latency permanent. [onBacklogExceeded] is invoked (once per episode,
- * on the submitting thread) when the queued backlog exceeds
- * [AUTO_CATCHUP_THRESHOLD_US] -- the caller is expected to trigger the same
- * resync a tap would (see [dropToLatestKeyFrameIfBuffered]), which both
- * drops the stale video backlog and flushes the correspondingly-backlogged
- * audio, recovering the latency instead of just playing through it.
+ * Each item's target time is derived from the box's own real presentation
+ * timestamp ([StreamEntry.packetTimeMs], confirmed millisecond-accurate
+ * against a real capture), translated once into this device's own
+ * monotonic clock ([nowUs], System.nanoTime()-based) -- not into the audio
+ * hardware's playback position, which this version deliberately avoids
+ * depending on at all: AudioTrack.flush() (used on a key-frame-jump resync)
+ * doesn't reliably guarantee getPlaybackHeadPosition() continues cleanly
+ * across devices, and an earlier version of this class that scheduled
+ * against it got bitten by exactly that, badly, after every resync.
+ * System.nanoTime() has no such quirk.
  *
- * [onSubmit] is called on the pacer's own thread, so it must be safe to call
- * from a thread other than the one that calls [submit].
+ * This still doesn't cover an actual network stall: during a stall neither
+ * stream gets new data, so there's no backlog building up yet to correct.
+ * Once the stall clears and a burst of backlog arrives, pacing it out at
+ * the normal rate would just make the resulting extra latency permanent.
+ * [onBacklogExceeded] is invoked (once per episode, on the submitting
+ * thread) when the queued backlog exceeds [AUTO_CATCHUP_THRESHOLD_US] --
+ * the caller is expected to trigger the same resync a tap would (see
+ * [dropToLatestKeyFrameIfBuffered]), which drops the stale backlog from
+ * both streams together (they share one queue, so this can't desync them)
+ * instead of just playing through the extra latency.
+ *
+ * [onVideoSubmit]/[onAudioSubmit] are called on the pacer's own thread, so
+ * they must be safe to call from a thread other than the one that calls
+ * [submitVideo]/[submitAudio].
  */
-private class VideoPacer(
-    private val frameIntervalUs: Long,
-    private val audioClockUs: () -> Long,
+private class MediaPacer(
+    // Deliberate playback cushion: re-anchoring (see submit()) targets this
+    // far *ahead* of the live wall clock instead of "due immediately", so a
+    // little content is normally sitting queued ahead of its dispatch
+    // deadline. That absorbs small arrival-timing jitter (network/decode
+    // variance) instead of it directly perturbing playback cadence, at the
+    // cost of this much fixed extra latency -- applied identically to both
+    // streams, see the class doc for why that matters.
+    private val cushionUs: Long,
     private val onBacklogExceeded: () -> Unit,
-    private val onSubmit: (ByteArray) -> Unit
+    private val onVideoSubmit: (ByteArray) -> Unit,
+    private val onAudioSubmit: (ByteArray) -> Unit
 ) {
     companion object {
         private const val AUTO_CATCHUP_THRESHOLD_US = 2_000_000L
     }
 
-    private class PacedFrame(val ptsUs: Long, val isKeyFrame: Boolean, val data: ByteArray)
+    // seq is a tiebreaker for items with equal ptsUs (see queue's own
+    // comment for why that happens routinely, not just in rare edge cases)
+    // -- PriorityBlockingQueue doesn't guarantee stable ordering among
+    // equal-priority elements on its own.
+    private class QueuedItem(val ptsUs: Long, val seq: Long, val isVideo: Boolean, val isKeyFrame: Boolean, val data: ByteArray)
 
-    private val queue = LinkedBlockingDeque<PacedFrame>()
-    // The real A/V offset: this frame's target time minus where audio actually
-    // is right now. Should stay small; a persistent backlog shows up as queue
-    // depth, not as a large value here, since each frame paces itself against
-    // the live clock regardless of how many others are queued behind it.
+    // Only ever touched from submit(), which is only ever called from one
+    // thread (the demux loop) -- a plain Long is fine, no atomics needed.
+    private var nextSeq = 0L
+
+    // Ordered by ptsUs, NOT submission order -- submission order alone
+    // isn't reliable here: an audio chunk usually completes (and reaches
+    // submit()) in a single packet, while a video frame -- especially a key
+    // frame, 10KB+ -- can take several packets to fully reassemble first.
+    // That means a video frame with an *earlier* ptsUs can genuinely arrive
+    // at this queue *after* audio chunks with later ptsUs values that
+    // simply finished assembling faster. A plain FIFO would queue those
+    // audio chunks ahead of it and pace them out first, so by the time the
+    // video frame (which should have played before all of them) finally
+    // arrives, real time has already passed its due point -- dispatching
+    // immediately, but late by roughly however long reassembly took.
+    // Confirmed as the actual mechanism behind video consistently lagging
+    // audio, scaling with frame size (worse for key frames) rather than
+    // being a fixed bias. A priority queue sidesteps this entirely: dispatch
+    // order is always by ptsUs regardless of what order items were handed
+    // to submit() in.
+    //
+    // ptsUs alone isn't a sufficient sort key, though: the box's timestamp
+    // (StreamEntry.packetTimeMs) is a *packet-level* field, shared by every
+    // entry a given wire packet carries. Audio chunks are small enough that
+    // several consecutive ones routinely land in the same packet and so get
+    // the exact same ptsUs -- PriorityBlockingQueue breaks ties between
+    // equal-priority elements arbitrarily, not by insertion order, so
+    // same-timestamp audio chunks could come out of their true sequence.
+    // Confirmed in practice as a small, audible "burbling"/after-echo
+    // effect: brief local reordering of consecutive audio, present
+    // regardless of buffer size or low-latency setting (consistent with a
+    // tie-breaking issue, not a timing/latency one). seq as a secondary key
+    // restores a stable, submission-order tiebreak for equal timestamps.
+    private val queue = PriorityBlockingQueue<QueuedItem>(11, compareBy({ it.ptsUs }, { it.seq }))
+    // How far off-schedule the last VIDEO dispatch was (its target time
+    // minus the wall clock at the moment it was actually handed off).
+    // Should stay small; a persistent backlog shows up as queue depth, not
+    // as a large value here, since each item paces itself against the live
+    // clock regardless of how many others are queued behind it. No longer
+    // a literal "audio vs video" measurement the way it used to be (both
+    // streams share the same schedule by construction now, so they can't
+    // drift apart from each other) -- just a pacer-health indicator.
     @Volatile var avOffsetUs: Long = 0
         private set
-    // Frames waiting to be paced out and sent to the decoder -- the actual
-    // backlog depth; avOffsetUs stays small regardless of how deep this is,
-    // since each frame paces itself against the live clock independently.
     val queueSize: Int get() = queue.size
-    // Real queued size in bytes (sum of each buffered frame's actual size),
-    // rather than just a frame count, for a backlog figure that means
-    // something in KB regardless of resolution/bitrate.
+    // Real queued size in bytes (sum of each buffered item's actual size),
+    // rather than just a count, for a backlog figure that means something
+    // in KB regardless of resolution/bitrate.
     val queueBytes: Long get() = queue.sumOf { it.data.size.toLong() }
     @Volatile private var running = true
     @Volatile private var backlogSignaled = false
+    // Translates the box's own relative clock (StreamEntry.packetTimeMs,
+    // milliseconds since the box's stream start -- not wall-clock/epoch)
+    // into this device's own monotonic clock (nowUs()'s timeline). Set once
+    // ever, from whichever stream (audio or video, whichever arrives first)
+    // submits first in a session (or the first after reset()), then reused
+    // for every later item from both streams -- see submit().
+    @Volatile private var offsetUs: Long? = null
+    // Set by fastDrainBuffer() (see doResync()) to dispatch every currently-
+    // queued item back-to-back, skipping the normal pacing wait, until the
+    // queue empties -- recovers the buffer cushion's added latency quickly
+    // on a keypress/tap resync that has no key frame to jump to instead.
+    // Nothing is dropped, it's just not paced.
+    @Volatile private var fastDrain = false
 
-    // Only ever touched from the submitting (network/demux) thread. Re-anchored
-    // to the live audio clock whenever the queue is empty (see submit()), which
-    // naturally covers both "first frame ever" and "ongoing drift correction."
-    private var nextPtsUs = 0L
+    private fun nowUs(): Long = System.nanoTime() / 1000
 
     private val thread: Thread = Thread {
         try {
             while (running) {
-                val frame = queue.take()
+                val item = queue.take()
                 if (!running) break
-                val waitUs = frame.ptsUs - audioClockUs()
-                if (waitUs > 0) {
-                    try {
-                        Thread.sleep(waitUs / 1000, ((waitUs % 1000) * 1000).toInt())
-                    } catch (_: InterruptedException) {
-                        if (!running) break
+                if (!fastDrain) {
+                    val waitUs = item.ptsUs - nowUs()
+                    if (waitUs > 0) {
+                        try {
+                            Thread.sleep(waitUs / 1000, ((waitUs % 1000) * 1000).toInt())
+                        } catch (_: InterruptedException) {
+                            if (!running) break
+                        }
                     }
                 }
-                onSubmit(frame.data)
-                avOffsetUs = frame.ptsUs - audioClockUs()
+                if (item.isVideo) onVideoSubmit(item.data) else onAudioSubmit(item.data)
+                if (item.isVideo) avOffsetUs = item.ptsUs - nowUs()
+                // Once drained to empty, normal paced dispatch resumes --
+                // offsetUs is not force-reprimed here, so this doesn't
+                // reintroduce the cushion's latency right after a resync
+                // whose whole point was to reduce it.
+                if (fastDrain && queue.isEmpty()) fastDrain = false
             }
         } catch (_: InterruptedException) {
         } catch (e: Exception) {
-            // audioClockUs()/onSubmit() touch the AudioTrack/codec, which
+            // onVideoSubmit()/onAudioSubmit() touch the codecs, which
             // stopPlayback() can release concurrently from the main thread --
             // an uncaught exception here would kill the whole process, not
             // just this thread (confirmed the hard way elsewhere already).
-            android.util.Log.e("SlingboxPlayer", "VideoPacer thread error", e)
+            android.util.Log.e("SlingboxPlayer", "MediaPacer thread error", e)
         }
     }.also { it.isDaemon = true; it.start() }
 
+    fun submitVideo(data: ByteArray, isKeyFrame: Boolean, boxTimeMs: Long) = submit(data, isVideo = true, isKeyFrame = isKeyFrame, boxTimeMs = boxTimeMs)
+    fun submitAudio(data: ByteArray, boxTimeMs: Long) = submit(data, isVideo = false, isKeyFrame = false, boxTimeMs = boxTimeMs)
+
     /**
-     * Assigns the next frame a steady PTS and enqueues it for pacing.
-     *
-     * Re-anchors nextPtsUs to the live audio clock whenever there's no backlog
-     * to preserve (queue empty at submit time) -- without this, the synthetic
-     * per-frame increment (based on the configured frame rate) drifts linearly
-     * away from real elapsed audio time whenever the stream's actual delivered
-     * frame rate doesn't exactly match that configured value, which it
-     * essentially never does exactly. Only re-anchoring when the queue is
-     * empty means an already-queued, deliberately-paced backlog never gets
-     * disturbed -- this only corrects drift once caught up.
+     * Assigns the next item (audio or video) a steady target time and
+     * enqueues it for pacing. boxTimeMs is the box's own real presentation
+     * time for this item (see StreamEntry.packetTimeMs) -- on the very
+     * first call ever (or the first after reset()), it anchors offsetUs so
+     * this item lands exactly cushionUs ahead of the live wall clock; every
+     * call after that, from either stream, just reuses that same offset, so
+     * the box's own timestamps (not arrival timing, not a synthesized
+     * schedule) are what determine pacing for both streams from then on.
      */
-    fun submit(data: ByteArray, isKeyFrame: Boolean) {
-        if (queue.isEmpty()) {
-            nextPtsUs = audioClockUs()
+    private fun submit(data: ByteArray, isVideo: Boolean, isKeyFrame: Boolean, boxTimeMs: Long) {
+        // Only expected to be unavailable if a future stream type doesn't
+        // carry this field -- falls back to "due immediately", rather than
+        // crashing or silently misbehaving, since it shouldn't happen on
+        // either path this app actually demuxes today.
+        val seq = nextSeq++
+        if (boxTimeMs < 0) {
+            queue.add(QueuedItem(nowUs(), seq, isVideo, isKeyFrame, data))
+            return
         }
-        val pts = nextPtsUs
-        nextPtsUs += frameIntervalUs
-        queue.addLast(PacedFrame(pts, isKeyFrame, data))
-        if (!backlogSignaled && queue.size.toLong() * frameIntervalUs > AUTO_CATCHUP_THRESHOLD_US) {
+        var offset = offsetUs
+        if (offset == null) {
+            offset = nowUs() + cushionUs - boxTimeMs * 1000
+            offsetUs = offset
+        }
+        val pts = boxTimeMs * 1000 + offset
+        queue.add(QueuedItem(pts, seq, isVideo, isKeyFrame, data))
+        val oldestQueuedPts = queue.peek()?.ptsUs
+        // Subtracts the deliberate cushion before comparing to the
+        // threshold -- without this, a larger cushion setting makes
+        // ordinary, correctly-paced playback look like excess backlog all
+        // by itself (the cushion IS queued depth, by design), triggering
+        // this auto-catchup needlessly and more often the bigger the
+        // buffer is -- confirmed in practice as A/V sync that got worse,
+        // not better, at larger buffer sizes.
+        val excessBacklogUs = if (oldestQueuedPts != null) (pts - oldestQueuedPts) - cushionUs else 0L
+        if (!backlogSignaled && excessBacklogUs > AUTO_CATCHUP_THRESHOLD_US) {
             backlogSignaled = true
             onBacklogExceeded()
         }
@@ -1952,38 +2105,56 @@ private class VideoPacer(
         queue.clear()
         avOffsetUs = 0
         backlogSignaled = false
+        offsetUs = null
     }
 
     /**
-     * On resync: if a key frame is already sitting in the backlog (common when
-     * pacing has let the network run ahead of real-time playback), jump
-     * straight to the most recent one and keep playing from there. Returns
-     * true if it found and kept one -- the caller should treat that as an
-     * already-complete resync.
+     * Dispatches whatever's currently queued back-to-back instead of paced
+     * one item at a time, draining the deliberate buffer cushion quickly.
+     * Used by doResync() when there's no buffered key frame to jump to
+     * instead -- see dropToLatestKeyFrameIfBuffered.
+     */
+    fun fastDrainBuffer() {
+        fastDrain = true
+    }
+
+    /**
+     * On resync: if a video key frame is already sitting in the backlog
+     * (common when pacing has let the network run ahead of real-time
+     * playback), jump straight to it and keep playing from there, dropping
+     * everything queued before it -- audio and video alike, since they
+     * share this one queue, so a jump can never leave the two out of step
+     * with each other. Returns true if it found and kept one -- the caller
+     * should treat that as an already-complete resync.
      *
      * If there's no key frame to jump to, this is a true no-op: the queue is
      * left exactly as it was (drained-then-restored, not discarded), nothing
      * else changes, and the caller should not fall back to dropping anything
      * or waiting for a fresh key frame from the network -- a tap with nothing
      * to jump to should not disrupt ongoing playback at all. Always false
-     * (and a no-op) when pacing is off, since frames go straight to the
-     * decoder in that mode and never accumulate here to begin with.
+     * (and a no-op) when pacing is off, since items go straight to their
+     * decoders in that mode and never accumulate here to begin with.
      */
     fun dropToLatestKeyFrameIfBuffered(): Boolean {
-        val drained = ArrayList<PacedFrame>(queue.size)
+        // poll() always returns the smallest ptsUs first (see queue's own
+        // comment), so drained comes out in ascending pts order regardless
+        // of submission order -- indexOfLast below is therefore genuinely
+        // "the key frame with the latest pts", not just "the last one that
+        // happened to arrive".
+        val drained = ArrayList<QueuedItem>(queue.size)
         while (true) {
-            val f = queue.pollFirst() ?: break
+            val f = queue.poll() ?: break
             drained.add(f)
         }
-        val keyIdx = drained.indexOfLast { it.isKeyFrame }
+        val keyIdx = drained.indexOfLast { it.isVideo && it.isKeyFrame }
         backlogSignaled = false
         if (keyIdx < 0) {
             // Nothing to jump to -- put everything back exactly as it was.
             // This must be a true no-op on the queue, not a silent discard.
-            for (f in drained) queue.addLast(f)
+            for (f in drained) queue.add(f)
             return false
         }
-        for (i in keyIdx until drained.size) queue.addLast(drained[i])
+        for (i in keyIdx until drained.size) queue.add(drained[i])
         return true
     }
 

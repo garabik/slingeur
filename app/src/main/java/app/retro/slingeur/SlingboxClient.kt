@@ -647,7 +647,17 @@ class SlingboxClient(
         val streamNumber: Int,
         val keyFrame: Boolean,
         val mediaObjectOffset: Int,
-        val payload: ByteArray
+        val payload: ByteArray,
+        // Real presentation time in milliseconds, straight from the box's
+        // own wire data -- the Solo path's "pktt" packet-header field, or
+        // the standard ASF path's per-payload (falling back to packet-level
+        // send time) Presentation Time field. -1 only if truly unavailable,
+        // which shouldn't happen on either path in practice. A relative
+        // clock (time since the box's own stream start, not wall-clock/
+        // epoch), confirmed millisecond-accurate against a real capture --
+        // see PlayerActivity.VideoPacer, which anchors video pacing to it
+        // directly instead of synthesizing timestamps from frame count.
+        val packetTimeMs: Long = -1L
     )
 
     /**
@@ -757,7 +767,7 @@ class SlingboxClient(
             log("ASF packet length field ($packetLength) doesn't match actual packet size (${raw.size}) -- parse may be misaligned")
         }
 
-        pos += 4 // send time
+        val sendTimeMs = u32() // packet-level fallback when a segment has no presentation time of its own
         pos += 2 // duration
 
         val multiplePayloads = (packetFlags and 0x01) != 0
@@ -785,10 +795,15 @@ class SlingboxClient(
             val fragOffset = readByLengthType(packetProperty ushr 2, 0)
             val replicSize = readByLengthType(packetProperty, 0)
 
+            // Real per-frame presentation time (ms), straight from the box --
+            // falls back to the packet-level send time when a segment's own
+            // replicated data doesn't carry one (the compact/no-timing
+            // cases), rather than leaving timing unknown for those.
+            var entryTimeMs = sendTimeMs
             when {
                 replicSize >= 8 -> {
                     pos += 4 // media object size (total frame size)
-                    pos += 4 // presentation time
+                    entryTimeMs = u32() // presentation time
                     val extra = (replicSize - 8).toInt()
                     if (extra > 0) pos += extra // payload extension system fields -- not needed, skipped opaque
                 }
@@ -812,7 +827,7 @@ class SlingboxClient(
                 "SlingboxAsfStd",
                 "  segment $seg: stream=$streamNumber keyFrame=$keyFrame fragOffset=$fragOffset replicSize=$replicSize fragSize=$fragSize"
             )
-            onEntry(StreamEntry(streamNumber, keyFrame, fragOffset.toInt(), raw.copyOfRange(pos, pos + fragSize)))
+            onEntry(StreamEntry(streamNumber, keyFrame, fragOffset.toInt(), raw.copyOfRange(pos, pos + fragSize), entryTimeMs))
             pos += fragSize
         }
     }
@@ -838,6 +853,10 @@ class SlingboxClient(
         bb.order(ByteOrder.LITTLE_ENDIAN)
 
         val pad = bb.getInt(5)
+        // Real per-frame presentation time (ms), straight from the box --
+        // see StreamEntry.packetTimeMs. Packet-level (shared by every entry
+        // this message carries), same as the standard ASF path's send time.
+        val pktt = bb.getInt(9).toLong() and 0xFFFFFFFFL
         var pcnt = msg[15].toInt() and 0xFF
 
         if ((pmode and -2) != RESTART_PMODE) {
@@ -877,7 +896,7 @@ class SlingboxClient(
                     // the first fragment. keyFrame mirrors the exact sn==0x82 case the
                     // decrypt logic treats as "start of a video key frame" below,
                     // rather than guessing at a generic single top bit.
-                    onEntry(StreamEntry(sn and 0x3F, sn == 0x82, objoff, msg.copyOfRange(off, off + length)))
+                    onEntry(StreamEntry(sn and 0x3F, sn == 0x82, objoff, msg.copyOfRange(off, off + length), pktt))
                 }
             }
 
@@ -893,7 +912,7 @@ class SlingboxClient(
             // per-entry payload already handed to onEntry for that fragment.
             fun emitGatedEntry(tailLen: Int) {
                 if (onEntry == null || off + length > msg.size) return
-                onEntry(StreamEntry(sn and 0x3F, sn == 0x82, objoff, msg.copyOfRange(off, off + length - tailLen)))
+                onEntry(StreamEntry(sn and 0x3F, sn == 0x82, objoff, msg.copyOfRange(off, off + length - tailLen), pktt))
             }
 
             // Emits a previously-held-back trailing remainder, now resolved by this
@@ -902,7 +921,7 @@ class SlingboxClient(
             // current entry's own stream if packets interleave video and audio.
             fun emitResolvedTail(resolved: ByteArray) {
                 if (onEntry == null || resolved.isEmpty() || pendingTailStreamNumber < 0) return
-                onEntry(StreamEntry(pendingTailStreamNumber, false, 1, resolved))
+                onEntry(StreamEntry(pendingTailStreamNumber, false, 1, resolved, pktt))
             }
 
             if (sn == 0x82 || (sn and 63) == 1) {

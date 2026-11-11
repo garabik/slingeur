@@ -72,6 +72,10 @@
             android:layout_marginTop="12dp"
             android:text="Pace video to real-time" />
 
+        <TextView style="@style/FieldLabel" android:text="Buffer size (frames)" />
+        <EditText android:id="@+id/bufferFramesEdit" android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:hint="Buffer size (frames)" android:inputType="number" />
+
         <CheckBox android:id="@+id/lowLatencyCheck" android:layout_width="wrap_content" android:layout_height="wrap_content"
             android:text="Low-latency mode" />
 
