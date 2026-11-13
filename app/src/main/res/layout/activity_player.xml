@@ -144,6 +144,11 @@
                     android:text="16:9"
                     android:textSize="13sp" />
                 <Button
+                    android:id="@+id/reloginButton"
+                    style="@style/IrButtonWideGrey"
+                    android:text="RELOGIN"
+                    android:textSize="10sp" />
+                <Button
                     android:id="@+id/quitButton"
                     style="@style/IrButtonWideGrey"
                     android:text="QUIT"

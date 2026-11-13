@@ -76,6 +76,7 @@ class PlayerActivity : Activity(), SurfaceHolder.Callback {
     private lateinit var debugInfoView: TextView
     private lateinit var settingsButton: Button
     private lateinit var aspectButton: Button
+    private lateinit var reloginButton: Button
     private lateinit var quitButton: Button
     private lateinit var irFlashView: TextView
     private lateinit var clockView: TextView
@@ -106,6 +107,45 @@ class PlayerActivity : Activity(), SurfaceHolder.Callback {
     private var videoCodecHandler: Handler? = null
     private var audioCodecThread: HandlerThread? = null
     private var audioCodecHandler: Handler? = null
+
+    // Set right before launching Settings, cleared once fully resumed --
+    // tells onPause()/surfaceDestroyed() to pause just the video decoder
+    // instead of tearing down the whole session (logout/reconnect), and
+    // onActivityResult()/surfaceCreated() to resume in place instead of
+    // reconnecting from scratch. See videoPauseRequested/videoResumeMode
+    // below for how the actual pause/resume happens on the session's own
+    // thread rather than this (the main) one.
+    private var settingsPending = false
+    // Checked once per demux-loop iteration (same pattern as
+    // resyncRequested/doResync()) so releasing videoCodec/videoPump/
+    // videoCodecThread happens on the session's own thread, not the main
+    // thread (onPause/surfaceDestroyed) racing that thread's own use of
+    // them.
+    @Volatile private var videoPauseRequested = false
+    // Likewise for resuming -- NONE means no resume pending, otherwise
+    // which of the two strategies to use. See runSession's
+    // resumeVideoForSettings() for what each one actually does.
+    @Volatile private var videoResumeMode = VideoResumeMode.NONE
+    // SPS/PPS extracted from the most recently started key frame, cached so
+    // a FAST Settings-resume can restart the decoder immediately without
+    // waiting for a fresh one from the wire -- see
+    // initVideoCodecFromFirstFrame and resumeVideoForSettings. Written on
+    // the session's own thread, read from onActivityResult on the main
+    // thread -- @Volatile for cross-thread visibility, same as the
+    // active* fields below.
+    @Volatile private var cachedSps: ByteArray? = null
+    @Volatile private var cachedPps: ByteArray? = null
+    // The box-affecting stream parameters as they were the last time
+    // SET_VIDEO_PARAMETERS was actually sent for this session -- compared
+    // against the active box after Settings closes to decide whether
+    // anything stream-affecting actually changed (see onActivityResult).
+    // Same cross-thread read/write pattern as cachedSps/cachedPps above.
+    @Volatile private var activeResolution = -1
+    @Volatile private var activeFrameRate = -1
+    @Volatile private var activeVideoBandwidth = -1
+    @Volatile private var activeVideoSmoothness = -1
+    @Volatile private var activeIframeRate = -1
+    @Volatile private var activeAudioBitRate = -1
 
     private val uiHandler = Handler(Looper.getMainLooper())
     private var hideControlsRunnable: Runnable? = null
@@ -216,6 +256,7 @@ class PlayerActivity : Activity(), SurfaceHolder.Callback {
         debugInfoView = findViewById(R.id.debugInfoView)
         settingsButton = findViewById(R.id.settingsButton)
         aspectButton = findViewById(R.id.aspectButton)
+        reloginButton = findViewById(R.id.reloginButton)
         quitButton = findViewById(R.id.quitButton)
         irFlashView = findViewById(R.id.irFlashView)
         clockView = findViewById(R.id.clockView)
@@ -272,9 +313,29 @@ class PlayerActivity : Activity(), SurfaceHolder.Callback {
         )
         rootFrame.setOnTouchListener { view, event -> onRootTouch(view, event) }
         settingsButton.setOnClickListener {
+            // See settingsPending's own comment -- lets the stream (network
+            // session, audio decode/playback) keep running underneath
+            // instead of a full logout+reconnect while Settings is up.
+            settingsPending = true
             startActivityForResult(Intent(this, SettingsActivity::class.java), SETTINGS_REQUEST_CODE)
         }
         aspectButton.setOnClickListener { cycleAspectRatio() }
+        reloginButton.setOnClickListener {
+            // stopPlayback() blocks briefly (bounded joins) same as
+            // quitButton's own click handler -- fine inline on the main
+            // thread. The 2s wait itself goes on its own throwaway thread
+            // so it doesn't freeze the UI, then startPlayback() (which
+            // reloads settings and spins up a fresh playThread) runs back
+            // on the main thread, same as every other caller of it.
+            stopPlayback()
+            Thread {
+                try {
+                    Thread.sleep(2000)
+                } catch (_: InterruptedException) {
+                }
+                runOnUiThread { startPlayback() }
+            }.start()
+        }
         quitButton.setOnClickListener {
             // stopPlayback() -> releaseSessionResources() already does a
             // proper client.logout() before closing the socket, same as any
@@ -706,29 +767,80 @@ class PlayerActivity : Activity(), SurfaceHolder.Callback {
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
-        if (requestCode == SETTINGS_REQUEST_CODE && resultCode == SettingsActivity.RESULT_DISCONNECT) {
+        if (requestCode != SETTINGS_REQUEST_CODE) return
+        if (resultCode == SettingsActivity.RESULT_DISCONNECT) {
+            settingsPending = false
             stopPlayback()
             finish()
+            return
         }
-        // Otherwise (saved, or just backed out): onResume() will reconnect with
-        // whatever AppSettings now holds, since navigating to Settings already
-        // paused (and logged out of) the current session via onPause().
+        // Saved, or just backed out, with the session kept alive the whole
+        // time (see settingsPending) -- decide how video should resume once
+        // the surface comes back (surfaceCreated/onResume): instantly with
+        // the cached SPS/PPS if nothing stream-affecting changed, or with a
+        // fresh SET_VIDEO_PARAMETERS sent in place (no reconnect -- the
+        // official app can change these live, so this should be possible
+        // too; see resumeVideoForSettings) if it did (box==null shouldn't
+        // normally happen mid-session, but falls back to the safer
+        // cold-start path rather than assuming nothing changed).
+        if (settingsPending && running) {
+            val box = AppSettings.activeBox(this)
+            val changed = box == null ||
+                box.resolution != activeResolution ||
+                box.frameRate != activeFrameRate ||
+                box.videoBandwidth != activeVideoBandwidth ||
+                box.videoSmoothness != activeVideoSmoothness ||
+                box.iframeRate != activeIframeRate ||
+                box.audioBitRate != activeAudioBitRate
+            videoResumeMode = if (changed) VideoResumeMode.PARAMS_CHANGED else VideoResumeMode.FAST
+        }
+    }
+
+    // Common to both possible "the player's surface is usable again" signals
+    // (surfaceCreated and onResume's own isValid check below) -- whichever
+    // fires first handles it; the other's call is a safe no-op, since
+    // startPlayback() already guards against a redundant call on its own
+    // (running is already true by then) and settingsPending is already
+    // false by then too.
+    private fun onPlayerSurfaceAvailable() {
+        if (settingsPending && running) {
+            // Resuming from Settings with the session kept alive the whole
+            // time -- just re-arm video (see resumeVideoForSettings, run on
+            // the session's own thread via videoResumeMode), don't
+            // reconnect from scratch.
+            settingsPending = false
+            if (videoResumeMode == VideoResumeMode.NONE) videoResumeMode = VideoResumeMode.FAST
+        } else {
+            startPlayback()
+        }
     }
 
     override fun surfaceCreated(holder: SurfaceHolder) {
-        startPlayback()
+        onPlayerSurfaceAvailable()
     }
 
     override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {}
 
     override fun surfaceDestroyed(holder: SurfaceHolder) {
-        stopPlayback()
+        if (settingsPending && running) {
+            // Settings is covering the screen -- Android is tearing this
+            // surface down as a normal consequence of that, same as it
+            // always would, but that no longer needs to mean stopping the
+            // whole session: pause just the video decoder (on the
+            // session's own thread, see videoPauseRequested), leaving the
+            // network session and audio alone.
+            videoPauseRequested = true
+        } else {
+            stopPlayback()
+        }
     }
 
     override fun onPause() {
         super.onPause()
         uiHandler.removeCallbacks(debugTick)
-        stopPlayback()
+        if (!(settingsPending && running)) {
+            stopPlayback()
+        }
     }
 
     override fun onResume() {
@@ -740,7 +852,7 @@ class PlayerActivity : Activity(), SurfaceHolder.Callback {
         uiHandler.removeCallbacks(debugTick)
         uiHandler.post(debugTick)
         if (surfaceView.holder.surface.isValid) {
-            startPlayback()
+            onPlayerSurfaceAvailable()
         }
     }
 
@@ -1070,8 +1182,6 @@ class PlayerActivity : Activity(), SurfaceHolder.Callback {
         if (running) return
         running = true
 
-        val s = AppSettings.load(this)
-
         playThread = Thread {
             try {
                 // Gives the box a moment to actually release the previous
@@ -1087,6 +1197,15 @@ class PlayerActivity : Activity(), SurfaceHolder.Callback {
                 } catch (_: InterruptedException) {
                 }
                 while (running) {
+                    // Reloaded on every attempt, not just the first -- a
+                    // reconnect can be triggered by a Settings-driven stream
+                    // restart (e.g. a resolution change the box can't apply
+                    // without actually restarting its own encoder, unlike a
+                    // bitrate tweak), and reusing a snapshot captured before
+                    // that change would silently revert it on reconnect:
+                    // confirmed in practice (resolution change reconnected
+                    // but kept playing at the old resolution).
+                    val s = AppSettings.load(this)
                     val shouldRetry = runSession(s)
                     if (!running || !shouldRetry) break
                     releaseSessionResources()
@@ -1201,6 +1320,24 @@ class PlayerActivity : Activity(), SurfaceHolder.Callback {
         audioCodecThread = HandlerThread("audio-codec-callbacks").also { it.start() }
         audioCodecHandler = Handler(audioCodecThread!!.looper)
 
+        // See onActivityResult/resumeVideoForSettings -- these track what
+        // was last actually sent to the box, so a Settings-close can tell
+        // whether anything stream-affecting changed.
+        activeResolution = s.resolution
+        activeFrameRate = s.frameRate
+        activeVideoBandwidth = s.videoBandwidth
+        activeVideoSmoothness = s.videoSmoothness
+        activeIframeRate = s.iframeRate
+        activeAudioBitRate = s.audioBitRate
+        cachedSps = null
+        cachedPps = null
+        // Stale values from a previous session shouldn't leak into a brand
+        // new one -- e.g. if that session died while Settings happened to
+        // be open, these could otherwise still be set when this fresh
+        // session's loop starts.
+        videoPauseRequested = false
+        videoResumeMode = VideoResumeMode.NONE
+
         val c = SlingboxClient(s.host, s.port, s.password, log = { status(it) })
         client = c
 
@@ -1227,8 +1364,17 @@ class PlayerActivity : Activity(), SurfaceHolder.Callback {
             start = c.openStream(s.resolution, isSolo)
         }
         val info = AsfHeader.parse(start.streamHeader)
-        val vWidth = if (info.videoWidth > 0) info.videoWidth else 640
-        val vHeight = if (info.videoHeight > 0) info.videoHeight else 480
+        // var, not val: a PARAMS_CHANGED Settings-resume (see
+        // resumeVideoForSettings) updates these to the newly-selected
+        // resolution's real pixel dimensions before the next
+        // initVideoCodecFromFirstFrame call -- left as the stale
+        // session-start values, the decoder would get configured for the
+        // old resolution regardless of what the box is now actually
+        // sending (confirmed in practice: video kept playing at the old
+        // resolution, including the debug readout, after a resolution
+        // change in Settings).
+        var vWidth = if (info.videoWidth > 0) info.videoWidth else 640
+        var vHeight = if (info.videoHeight > 0) info.videoHeight else 480
         val aRate = if (info.audioSampleRate > 0) info.audioSampleRate else 32000
         val aChannels = if (info.audioChannels > 0) info.audioChannels else 2
         lastVideoWidth = vWidth
@@ -1288,6 +1434,18 @@ class PlayerActivity : Activity(), SurfaceHolder.Callback {
         var videoStarted = false
         var requireKeyFrameToStart = true
         var videoCodecReady = false
+        // True for the whole window between pauseVideoForSettings() and
+        // resumeVideoForSettings() -- distinct from videoCodecReady/
+        // requireKeyFrameToStart, which a real keyframe arriving during
+        // that window could otherwise satisfy on their own (requireKeyFrameToStart
+        // may well already be false, left over from before the pause),
+        // triggering initVideoCodecFromFirstFrame to configure a codec
+        // against whatever the surface reference happens to be *right
+        // then* -- which, while Settings is still open, is either stale or
+        // invalid. Checked first thing in the video branch below to skip
+        // all video handling entirely until resumeVideoForSettings()
+        // explicitly says otherwise.
+        var videoSettingsPaused = false
         // codec.start() succeeding (see initVideoCodecFromFirstFrame) doesn't
         // guarantee it ever actually decodes anything -- e.g. if SPS/PPS
         // extraction from the first key frame failed below, some decoders
@@ -1301,7 +1459,24 @@ class PlayerActivity : Activity(), SurfaceHolder.Callback {
         lastRateSampleAt = 0L
         lastRateSampleBytes = 0L
         lastDisplayedRateKbps = 0.0
-        var audioOnlyNoticeShown = false
+        // Wall-clock time a video frame last genuinely started
+        // (mediaObjectOffset == 0 on the video stream) -- not updated by a
+        // lone continuation fragment that never completes into a real
+        // frame, so a stray/incomplete fragment can't silently suppress
+        // "No video" on its own. Covers both "never had video this
+        // session" (starts at session start, so a long-enough gap before
+        // the very first frame already counts) and "video stopped
+        // partway through" (e.g. the source device was powered off via
+        // IR, confirmed in practice -- audio keeps flowing, video just
+        // stops) with the same one check, rather than treating the two as
+        // separate cases.
+        var lastVideoPacketAt = System.currentTimeMillis()
+        // A short grace period (rather than reacting the instant a video
+        // frame is late) avoids flapping the test card on ordinary jitter
+        // between frames, or on normal startup latency before the very
+        // first key frame arrives.
+        val videoStallTimeoutMs = 2000L
+        var noVideoShown = false
 
         // Diagnostic escape hatch (Settings): with pacing off, frames go straight to
         // the codec as soon as they're reassembled, for isolating decode issues from
@@ -1353,6 +1528,13 @@ class PlayerActivity : Activity(), SurfaceHolder.Callback {
                 status("Key frame has no SPS/PPS yet; waiting for a usable one")
                 return false
             }
+            // Cached for a possible FAST Settings-resume later (see
+            // resumeVideoForSettings) -- not cleared here even though this
+            // function can run again later in the session (a key frame's
+            // SPS/PPS don't normally change without a stream-parameter
+            // change, which goes through the PARAMS_CHANGED path instead).
+            cachedSps = sps
+            cachedPps = pps
             setupVideoCodec(vWidth, vHeight, s.videoDecoder, s.lowLatencyHint)
             videoCodec!!.start()
             videoCodecReady = true
@@ -1361,7 +1543,7 @@ class PlayerActivity : Activity(), SurfaceHolder.Callback {
             // setupVideoCodec's own onOutputBufferAvailable, which is where
             // the test card really gets hidden, on the first frame actually
             // rendered).
-            if (audioOnlyNoticeShown) status("Video signal resumed.")
+            if (noVideoShown) status("Video signal resumed.")
             val csd = byteArrayOf(0, 0, 0, 1) + sps + byteArrayOf(0, 0, 0, 1) + pps
             videoPump?.submit(PendingFrame(csd, MediaCodec.BUFFER_FLAG_CODEC_CONFIG))
             return true
@@ -1435,16 +1617,137 @@ class PlayerActivity : Activity(), SurfaceHolder.Callback {
             status("Resynced: jumped to a buffered key frame.")
         }
 
-        // Tracks video going quiet *after* it already started, not just
-        // "never started" (audioOnlyNoticeShown's job, above) -- e.g. the
-        // source device gets switched off mid-watch. Audio keeps flowing
-        // either way, so its arrival doubles as a clock to notice video has
-        // gone stale against. A short grace period (rather than reacting the
-        // instant a video packet is late) avoids flapping the test card on
-        // ordinary jitter between frames.
-        var lastVideoPacketAt = System.currentTimeMillis()
-        var videoStalled = false
-        val videoStallTimeoutMs = 2500L
+        // Releases just the video decoder (codec/pump/callback thread),
+        // leaving the control connection, audio decode/playback, and this
+        // very demux loop completely untouched -- used when Settings covers
+        // the screen and SurfaceView's own surface gets torn down as a
+        // result (see PlayerActivity.surfaceDestroyed/onPause). Runs here,
+        // on this session's own thread (triggered via videoPauseRequested,
+        // checked below, same pattern as doResync()/resyncRequested),
+        // specifically so this never races the main thread releasing the
+        // same fields concurrently.
+        fun pauseVideoForSettings() {
+            videoPump?.clear()
+            videoPump = null
+            try { videoCodec?.stop() } catch (_: Exception) {}
+            try { videoCodec?.release() } catch (_: Exception) {}
+            videoCodec = null
+            videoCodecThread?.quitSafely()
+            videoCodecThread = null
+            videoCodecHandler = null
+            videoCodecReady = false
+            videoStarted = false
+            videoAccum.reset()
+            videoSettingsPaused = true
+        }
+
+        // Re-arms video after a pauseVideoForSettings(), on this same
+        // thread, one of two ways depending on mode:
+        // - FAST: Settings closed without changing anything stream-
+        //   affecting -- reuses the cached SPS/PPS to restart the decoder
+        //   immediately and feed it whatever arrives next, key or delta
+        //   frame alike. A delta frame decoded with no reference picture
+        //   available produces visibly corrupted output for a few frames,
+        //   not a crash or a wedge (this app already confirmed the real
+        //   failure mode -- no SPS/PPS at all -- is far worse and
+        //   permanent, which is specifically why that's not what's
+        //   happening here); it clears up on its own at the next real key
+        //   frame, same as any ordinary lost-reference glitch.
+        // - PARAMS_CHANGED: Settings was saved with a different stream
+        //   parameter -- sends a fresh SET_VIDEO_PARAMETERS over the
+        //   still-alive control connection first (no relogin needed, see
+        //   SlingboxClient.setVideoParameters), then falls back to the
+        //   normal cold-start path: wait for the next real key frame and
+        //   extract fresh SPS/PPS from it, exactly like a brand new
+        //   session would, since the box may now be sending a different
+        //   resolution.
+        fun resumeVideoForSettings(mode: VideoResumeMode) {
+            // Defensive: don't assume pauseVideoForSettings() already ran --
+            // its trigger (surfaceDestroyed) isn't guaranteed to fire for
+            // every Settings-open on every device/timing. Release whatever
+            // video state is still there first, unconditionally, before
+            // creating anything new. This matters: creating a second
+            // hardware decoder instance while an old one is still alive can
+            // throw on devices that only support one concurrent instance of
+            // a given codec type, and since this whole function runs
+            // directly in the main loop (not inside readAndDemuxPacket's own
+            // try/catch), an uncaught exception here would propagate all the
+            // way up through runSession() to playThread's top-level handler
+            // and tear the whole session down -- a real, concrete way the
+            // intermittent "disconnects on resume" seen in practice could
+            // happen, independent of whether stream parameters changed.
+            try {
+                pauseVideoForSettings()
+                // pauseVideoForSettings() just set this true -- clear it
+                // right away, since this function's whole job from here on
+                // is re-arming video, and every path below (including the
+                // cold-start fallback) needs the demux loop's video branch
+                // to actually let entries through again. Previously never
+                // reset anywhere: once Settings was opened once, this stayed
+                // true for the rest of the session, silently dropping every
+                // later video entry at the gate below -- a permanent black
+                // screen with audio still playing, confirmed in practice.
+                videoSettingsPaused = false
+                videoCodecThread = HandlerThread("video-codec-callbacks").also { it.start() }
+                videoCodecHandler = Handler(videoCodecThread!!.looper)
+                if (mode == VideoResumeMode.PARAMS_CHANGED) {
+                    val box = AppSettings.activeBox(this)
+                    if (box != null) {
+                        c.setVideoParameters(box.resolution, box.frameRate, box.videoBandwidth, box.videoSmoothness, box.iframeRate, box.audioBitRate)
+                        activeResolution = box.resolution
+                        activeFrameRate = box.frameRate
+                        activeVideoBandwidth = box.videoBandwidth
+                        activeVideoSmoothness = box.videoSmoothness
+                        activeIframeRate = box.iframeRate
+                        activeAudioBitRate = box.audioBitRate
+                        // If resolution itself changed, the next
+                        // initVideoCodecFromFirstFrame call needs to
+                        // configure the decoder for the *new* dimensions,
+                        // not whatever was true at session start -- see
+                        // vWidth/vHeight's own comment.
+                        val opt = SlingboxResolution.OPTIONS.firstOrNull { it.value == box.resolution }
+                        if (opt != null && opt.width > 0) {
+                            vWidth = opt.width
+                            vHeight = opt.height
+                            lastVideoWidth = vWidth
+                            lastVideoHeight = vHeight
+                        }
+                    }
+                } else {
+                    val sps = cachedSps
+                    val pps = cachedPps
+                    if (sps != null && pps != null) {
+                        val fresh = AppSettings.load(this)
+                        setupVideoCodec(vWidth, vHeight, fresh.videoDecoder, fresh.lowLatencyHint)
+                        videoCodec!!.start()
+                        videoCodecReady = true
+                        val csd = byteArrayOf(0, 0, 0, 1) + sps + byteArrayOf(0, 0, 0, 1) + pps
+                        videoPump?.submit(PendingFrame(csd, MediaCodec.BUFFER_FLAG_CODEC_CONFIG))
+                        videoStarted = true
+                        requireKeyFrameToStart = false
+                        return
+                    }
+                    // No cached SPS/PPS (video never actually started this
+                    // session, e.g. it was audio-only the whole time) --
+                    // fall through to the normal cold-start wait below.
+                }
+                videoCodecReady = false
+                videoStarted = false
+                requireKeyFrameToStart = true
+            } catch (e: Exception) {
+                // Never let a resume failure kill the whole session (see
+                // the comment above for why that was a real risk) -- fall
+                // back to the safe cold-start wait instead of propagating.
+                android.util.Log.e("SlingboxPlayer", "resumeVideoForSettings failed, falling back to cold start", e)
+                videoSettingsPaused = false
+                try { videoCodec?.release() } catch (_: Exception) {}
+                videoCodec = null
+                videoPump = null
+                videoCodecReady = false
+                videoStarted = false
+                requireKeyFrameToStart = true
+            }
+        }
 
         var shouldRetry = false
         try {
@@ -1453,21 +1756,57 @@ class PlayerActivity : Activity(), SurfaceHolder.Callback {
                     resyncRequested = false
                     doResync()
                 }
+                if (videoPauseRequested) {
+                    videoPauseRequested = false
+                    // Same reasoning as resumeVideoForSettings's own
+                    // try/catch -- this runs directly in the main loop, not
+                    // inside readAndDemuxPacket's own try/catch, so an
+                    // uncaught exception here would otherwise tear the
+                    // whole session down instead of just failing to pause
+                    // video cleanly.
+                    try {
+                        pauseVideoForSettings()
+                    } catch (e: Exception) {
+                        android.util.Log.e("SlingboxPlayer", "pauseVideoForSettings failed", e)
+                    }
+                }
+                val resumeMode = videoResumeMode
+                if (resumeMode != VideoResumeMode.NONE) {
+                    videoResumeMode = VideoResumeMode.NONE
+                    resumeVideoForSettings(resumeMode)
+                }
                 val more = c.readAndDemuxPacket(start.packetSize, isSolo) { e ->
                     when (e.streamNumber) {
                         info.videoStreamNumber -> {
-                            lastVideoPacketAt = System.currentTimeMillis()
-                            if (videoStalled) {
-                                videoStalled = false
-                                status("Video signal resumed.")
-                                runOnUiThread { noVideoImage.visibility = android.view.View.GONE; syncStatusVisibility() }
-                            }
+                            // Settings is open (or was, and resumeVideoForSettings()
+                            // hasn't run yet this iteration) -- skip video
+                            // entirely rather than risk a real key frame
+                            // arriving during this window satisfying
+                            // requireKeyFrameToStart/videoStarted on its own
+                            // and triggering initVideoCodecFromFirstFrame
+                            // against the surface's current (stale or
+                            // invalid) state. videoAccum is already empty
+                            // (pauseVideoForSettings() reset it) and stays
+                            // that way the whole time this is true.
+                            if (videoSettingsPaused) return@readAndDemuxPacket
                             // Sling's own fragmentation boundaries (mediaObjectOffset) are
                             // arbitrary ~3000-byte packet chops with no relationship to
                             // H.264 NAL unit boundaries -- a single NAL can span multiple
                             // fragments, confirmed against a real capture. Reassemble full
                             // access units before handing them to the pacer/codec.
                             if (e.mediaObjectOffset == 0) {
+                                // A video frame is genuinely starting -- this, not a lone
+                                // continuation fragment of one, is what counts as "there is
+                                // video" for noVideoShown's purposes. A real but empty/blank
+                                // frame from the box still lands here and correctly keeps
+                                // the test card down; a stray fragment that never reaches a
+                                // fresh mediaObjectOffset==0 doesn't get to fake that.
+                                lastVideoPacketAt = System.currentTimeMillis()
+                                if (noVideoShown) {
+                                    noVideoShown = false
+                                    status("Video signal resumed.")
+                                    runOnUiThread { noVideoImage.visibility = android.view.View.GONE; syncStatusVisibility() }
+                                }
                                 if (videoAccum.size() > 0) {
                                     handleCompleteVideoFrame(videoAccum.toByteArray(), videoFrameTimeMs)
                                     videoAccum.reset()
@@ -1492,15 +1831,13 @@ class PlayerActivity : Activity(), SurfaceHolder.Callback {
                             // The box sends no video frames at all (not even a blank one)
                             // when it detects no video signal on the selected input -- e.g.
                             // the downstream source is powered off -- audio keeps flowing
-                            // normally the whole time. Flag that clearly once, rather than
-                            // leaving the screen looking frozen with no explanation.
-                            if (!videoCodecReady && !audioOnlyNoticeShown) {
-                                audioOnlyNoticeShown = true
-                                status("No video")
-                                runOnUiThread { noVideoImage.visibility = android.view.View.VISIBLE; syncStatusVisibility() }
-                            } else if (videoCodecReady && !videoStalled &&
+                            // normally the whole time. One check covers both "never had
+                            // video at all this session" and "video stopped partway
+                            // through" -- lastVideoPacketAt starts at session start, so a
+                            // long-enough gap before the very first frame already counts.
+                            if (!noVideoShown &&
                                 System.currentTimeMillis() - lastVideoPacketAt > videoStallTimeoutMs) {
-                                videoStalled = true
+                                noVideoShown = true
                                 status("No video")
                                 runOnUiThread { noVideoImage.visibility = android.view.View.VISIBLE; syncStatusVisibility() }
                             }
@@ -1525,9 +1862,13 @@ class PlayerActivity : Activity(), SurfaceHolder.Callback {
                 bytesReceivedTotal += start.packetSize
                 if (!more) {
                     status("Stream ended")
-                    // Only worth retrying if we weren't already asked to
-                    // stop -- e.g. the box just renegotiating the stream
-                    // format, not the activity being backgrounded.
+                    // An ordinary audio-only -> video format-restart signal
+                    // no longer reaches here at all -- readAndDemuxPacket
+                    // now tolerates those internally and keeps returning
+                    // true, so this session just keeps going. Only worth
+                    // retrying if we weren't already asked to stop -- e.g.
+                    // a genuine connection failure, not the activity being
+                    // backgrounded.
                     shouldRetry = running
                     break
                 }
@@ -1807,6 +2148,23 @@ private fun buildAnnexB(nals: List<Pair<Int, ByteArray>>, excludeTypes: Set<Int>
         out.write(bytes)
     }
     return out.toByteArray()
+}
+
+/**
+ * How to resume video after a Settings-triggered pause -- see
+ * PlayerActivity.resumeVideoForSettings().
+ */
+private enum class VideoResumeMode {
+    NONE,
+    // Settings closed without changing anything stream-affecting -- restart
+    // the decoder immediately with the cached SPS/PPS and feed it whatever
+    // arrives next.
+    FAST,
+    // Settings closed with a changed stream parameter -- a fresh
+    // SET_VIDEO_PARAMETERS is needed, and the box may now be sending a
+    // different resolution, so fall back to the normal cold-start wait for
+    // a fresh key frame with its own SPS/PPS.
+    PARAMS_CHANGED
 }
 
 /**

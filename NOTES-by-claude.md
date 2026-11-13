@@ -134,13 +134,17 @@ A capture taken against a real ProHD box and inspected with `ffprobe`/
   to learn it from otherwise).
 - `PlayerActivity.kt` — the live player: reassembles per-stream fragments
   into complete frames and feeds them to `MediaCodec` via `CodecInputPump`;
-  `VideoPacer` for real-time-clock-based pacing with backlog catch-up;
-  pinch-zoom/pan (touch and keyboard); the full touch-gesture and
-  physical-keyboard remote-control input handling; the test-card no-video
-  placeholder; the reconnect-with-backoff loop (handles the box's own
-  "stream restarted" signal on audio→video transitions, and cleans up +
-  notifies the user if a reconnect attempt ultimately gives up rather than
-  silently dying).
+  `MediaPacer` paces both audio and video through one shared, timestamp-
+  ordered queue against the box's own real clock (see `StreamEntry.packetTimeMs`
+  in `SlingboxClient.kt`), with backlog catch-up; pinch-zoom/pan (touch and
+  keyboard); the full touch-gesture and physical-keyboard remote-control
+  input handling; the test-card no-video placeholder; the reconnect-with-
+  backoff loop (cleans up + notifies the user if a reconnect attempt
+  ultimately gives up rather than silently dying). The box's own "stream
+  restarted" signal on an audio-only → video transition is now tolerated
+  in place by `SlingboxClient.readAndDemuxPacket` itself (up to a bounded
+  number of consecutive occurrences) rather than triggering this reconnect
+  loop at all.
 - `AppSettings.kt` — SharedPreferences-backed settings. Multiple
   `SlingboxProfile`s (host/port/password/video source/box type/resolution/
   bitrate/frame-rate/smoothness/keyframe-interval/audio-bitrate each) stored

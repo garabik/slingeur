@@ -344,6 +344,26 @@ class SlingboxClient(
                 leShort(0x180) + leShort(1) + leShort(0x1e) + leShort(0) + leShort(0x3d) + zeros(76)
         )
 
+        if (!setVideoParameters(resolution, frameRate, videoBandwidth, videoSmoothness, iframeRate, audioBitRate)) {
+            return false
+        }
+
+        log("Session established. sid=$sid")
+        return true
+    }
+
+    /**
+     * Sends SET_VIDEO_PARAMETERS (0xb5) over the already-established control
+     * connection -- just a regular command, same mechanism as [sendKeycode]/
+     * [keepAlive]. Factored out of [startSession] so a caller can re-send new
+     * parameters mid-session (e.g. after the user changes resolution/bitrate/
+     * etc. in Settings) without a fresh login -- nothing about this command
+     * requires one.
+     */
+    fun setVideoParameters(
+        resolution: Int, frameRate: Int, videoBandwidth: Int,
+        videoSmoothness: Int, iframeRate: Int, audioBitRate: Int
+    ): Boolean {
         log("Setting video parameters (${SlingboxResolution.dimensionsLabel(resolution)} framerate=$frameRate bw=$videoBandwidth smoothness=$videoSmoothness iframe=$iframeRate audio=$audioBitRate)")
         val vp = leInt(0xff) + leInt(0xff) + leInt(resolution) + leInt(1) +
             leInt((iframeRate shl 24) + (frameRate shl 16) + videoBandwidth) +
@@ -357,8 +377,6 @@ class SlingboxClient(
             log("Error setting video parameters, stat=0x${stat.toString(16)}")
             return false
         }
-
-        log("Session established. sid=$sid")
         return true
     }
 
@@ -655,8 +673,8 @@ class SlingboxClient(
         // which shouldn't happen on either path in practice. A relative
         // clock (time since the box's own stream start, not wall-clock/
         // epoch), confirmed millisecond-accurate against a real capture --
-        // see PlayerActivity.VideoPacer, which anchors video pacing to it
-        // directly instead of synthesizing timestamps from frame count.
+        // see PlayerActivity.MediaPacer, which anchors pacing to it directly
+        // instead of synthesizing timestamps from frame count.
         val packetTimeMs: Long = -1L
     )
 
@@ -664,8 +682,17 @@ class SlingboxClient(
      * Like [readAndDecryptPacket], but additionally invokes [onEntry] for every
      * payload-parsing-info entry found in the packet (not just the ones that
      * needed decryption), so a caller can demux by ASF Stream Number instead of
-     * just getting back one flat blob. Returns false at end of stream / on a
-     * format-restart signal, true otherwise.
+     * just getting back one flat blob. Returns false only at genuine end of
+     * stream (closed socket, short read, exception) -- a format-restart signal
+     * (see processSoloMsg) is tolerated unconditionally rather than ending the
+     * stream: the box emits it on its own whenever it has to actually restart
+     * its encoder mid-session (e.g. a resolution change, confirmed in practice;
+     * bitrate/framerate/etc. apply without one), and real Solo data just
+     * resumes right after on this same connection -- no reconnect needed. The
+     * box can also go quiet on video alone without any restart signal at all
+     * (e.g. the source device powered off via IR) while audio keeps flowing
+     * normally -- that's not handled here, since it's not actually a stream
+     * problem; see PlayerActivity's own "No video" test-card logic.
      *
      * [solo] selects which wire protocol to parse: Solo/ProHD boxes packetize
      * and TEA-encrypt the stream (processSoloMsg); other models (Classic, 350,
@@ -680,10 +707,8 @@ class SlingboxClient(
             val raw = readFullyStream(sIn, pksize) ?: return false
             if (raw.size < 16) return false
             if (solo) {
-                when (processSoloMsg(raw, onEntry)) {
-                    is SoloResult.Restart -> false
-                    is SoloResult.Data -> true
-                }
+                processSoloMsg(raw, onEntry)
+                true
             } else {
                 parseStandardAsfPacket(raw, onEntry)
                 true
