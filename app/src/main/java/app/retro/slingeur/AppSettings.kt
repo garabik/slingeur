@@ -161,6 +161,7 @@ object AppSettings {
     private const val KEY_FULLSCREEN_ENABLED = "fullscreenEnabled"
     private const val KEY_DEBUG_MESSAGES_ENABLED = "debugMessagesEnabled"
     private const val KEY_DISPLAY_TIME_ENABLED = "displayTimeEnabled"
+    private const val KEY_KEEP_SCREEN_ON_ENABLED = "keepScreenOnEnabled"
 
     private fun prefs(context: Context): SharedPreferences =
         context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -186,7 +187,13 @@ object AppSettings {
         val lowLatencyHint: Boolean,
         val fullscreenEnabled: Boolean,
         val debugMessagesEnabled: Boolean,
-        val displayTimeEnabled: Boolean
+        val displayTimeEnabled: Boolean,
+        // Keeps the screen on (no dim/lock from the system idle timeout)
+        // while the player is in the foreground -- see PlayerActivity's
+        // applyKeepScreenOn(). On by default: this app is normally watched
+        // hands-off for a while, so the system's own idle timeout locking
+        // the screen mid-playback is the more surprising default.
+        val keepScreenOnEnabled: Boolean
     )
 
     fun load(context: Context): Snapshot {
@@ -210,8 +217,9 @@ object AppSettings {
             bufferFrames = p.getInt(KEY_BUFFER_FRAMES, 2),
             lowLatencyHint = p.getBoolean(KEY_LOW_LATENCY_HINT, true),
             fullscreenEnabled = p.getBoolean(KEY_FULLSCREEN_ENABLED, true),
-            debugMessagesEnabled = p.getBoolean(KEY_DEBUG_MESSAGES_ENABLED, true),
-            displayTimeEnabled = p.getBoolean(KEY_DISPLAY_TIME_ENABLED, true)
+            debugMessagesEnabled = p.getBoolean(KEY_DEBUG_MESSAGES_ENABLED, false),
+            displayTimeEnabled = p.getBoolean(KEY_DISPLAY_TIME_ENABLED, true),
+            keepScreenOnEnabled = p.getBoolean(KEY_KEEP_SCREEN_ON_ENABLED, true)
         )
     }
 
@@ -230,6 +238,7 @@ object AppSettings {
             .putBoolean(KEY_FULLSCREEN_ENABLED, s.fullscreenEnabled)
             .putBoolean(KEY_DEBUG_MESSAGES_ENABLED, s.debugMessagesEnabled)
             .putBoolean(KEY_DISPLAY_TIME_ENABLED, s.displayTimeEnabled)
+            .putBoolean(KEY_KEEP_SCREEN_ON_ENABLED, s.keepScreenOnEnabled)
             .apply()
     }
 

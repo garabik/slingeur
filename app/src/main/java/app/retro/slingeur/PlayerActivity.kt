@@ -149,7 +149,7 @@ class PlayerActivity : Activity(), SurfaceHolder.Callback {
 
     private val uiHandler = Handler(Looper.getMainLooper())
     private var hideControlsRunnable: Runnable? = null
-    private var debugMessagesEnabled = true
+    private var debugMessagesEnabled = false
     // Last physical key event seen by onKeyDown, shown on the debug row
     // when debug is on -- handy for checking what keyCode a given remote
     // button actually sends, without needing logcat.
@@ -298,6 +298,7 @@ class PlayerActivity : Activity(), SurfaceHolder.Callback {
         applyAspectRatio()
         applyDebugVisibility()
         applyClockVisibility()
+        applyKeepScreenOn()
         applyInsetsPadding()
         surfaceView.holder.addCallback(this)
 
@@ -849,6 +850,7 @@ class PlayerActivity : Activity(), SurfaceHolder.Callback {
         applyAspectRatio()
         applyDebugVisibility()
         applyClockVisibility()
+        applyKeepScreenOn()
         uiHandler.removeCallbacks(debugTick)
         uiHandler.post(debugTick)
         if (surfaceView.holder.surface.isValid) {
@@ -889,6 +891,21 @@ class PlayerActivity : Activity(), SurfaceHolder.Callback {
     private fun applyClockVisibility() {
         clockView.visibility = if (AppSettings.load(this).displayTimeEnabled)
             android.view.View.VISIBLE else android.view.View.GONE
+    }
+
+    // FLAG_KEEP_SCREEN_ON only ever affects this window while it's actually
+    // on top (Settings covering it doesn't clear it -- Android just stops
+    // honoring it while this window isn't the foreground one), so there's
+    // no need to also touch it from onPause/onResume around a Settings
+    // visit; re-applying it here on every onResume (same call site as the
+    // other apply*Visibility functions) is just so a change made in
+    // Settings takes effect immediately on return.
+    private fun applyKeepScreenOn() {
+        if (AppSettings.load(this).keepScreenOnEnabled) {
+            window.addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        } else {
+            window.clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
     }
 
     // Cancels whatever toast is still showing before posting a new one --
@@ -1579,6 +1596,32 @@ class PlayerActivity : Activity(), SurfaceHolder.Callback {
         // that has nothing to actually jump to.
         fun doResync() {
             lastResyncAtMs = System.currentTimeMillis()
+            if (!s.pacingEnabled) {
+                // With pacing off, frames bypass MediaPacer entirely (see
+                // submitVideoFrame/submitAudioFrame above), so its queue is
+                // always empty here -- dropToLatestKeyFrameIfBuffered() and
+                // fastDrainBuffer() below are both no-ops in that case (see
+                // their own doc comments), and a tap would otherwise do
+                // nothing at all. The actual backlog from a stall sits in
+                // videoPump/audioPump's own pending-frame queues and
+                // AudioTrack's hardware buffer instead -- drop those
+                // directly. No key frame is kept in hand this way (unlike
+                // the pacer's own jump-to-keyframe path below), so still
+                // wait for a fresh one before resuming video.
+                lastResyncKind = "drop backlog"
+                videoAccum.reset()
+                audioAccum.reset()
+                videoPump?.clear()
+                audioPump?.clear()
+                try {
+                    audioTrack?.flush()
+                } catch (_: Exception) {
+                }
+                videoStarted = false
+                requireKeyFrameToStart = true
+                status("Resynced: dropped backlog.")
+                return
+            }
             if (!pacer.dropToLatestKeyFrameIfBuffered()) {
                 // Nothing to jump to -- still worth draining the deliberate
                 // buffer cushion (see MediaPacer's cushionUs) quickly rather
@@ -1802,14 +1845,24 @@ class PlayerActivity : Activity(), SurfaceHolder.Callback {
                                 // the test card down; a stray fragment that never reaches a
                                 // fresh mediaObjectOffset==0 doesn't get to fake that.
                                 lastVideoPacketAt = System.currentTimeMillis()
-                                if (noVideoShown) {
-                                    noVideoShown = false
-                                    status("Video signal resumed.")
-                                    runOnUiThread { noVideoImage.visibility = android.view.View.GONE; syncStatusVisibility() }
-                                }
                                 if (videoAccum.size() > 0) {
                                     handleCompleteVideoFrame(videoAccum.toByteArray(), videoFrameTimeMs)
                                     videoAccum.reset()
+                                }
+                                // Gated on videoCodecReady, not just on a frame having
+                                // started: the box can keep emitting video-stream entries
+                                // with no SPS/PPS (no working codec yet) while there's
+                                // genuinely no source signal, right alongside audio that's
+                                // flowing fine -- clearing the flag on every such entry
+                                // caused the test card to blink on/off in lockstep with
+                                // those frame-start/audio-fragment arrivals before the
+                                // source device was ever powered on. Only an entry that
+                                // actually got (or kept) the codec running counts as "there
+                                // is video" here.
+                                if (noVideoShown && videoCodecReady) {
+                                    noVideoShown = false
+                                    status("Video signal resumed.")
+                                    runOnUiThread { noVideoImage.visibility = android.view.View.GONE; syncStatusVisibility() }
                                 }
                                 // The box's own timestamp for the frame that's about to
                                 // start accumulating -- captured here (its first
@@ -1831,15 +1884,28 @@ class PlayerActivity : Activity(), SurfaceHolder.Callback {
                             // The box sends no video frames at all (not even a blank one)
                             // when it detects no video signal on the selected input -- e.g.
                             // the downstream source is powered off -- audio keeps flowing
-                            // normally the whole time. One check covers both "never had
-                            // video at all this session" and "video stopped partway
-                            // through" -- lastVideoPacketAt starts at session start, so a
-                            // long-enough gap before the very first frame already counts.
-                            if (!noVideoShown &&
-                                System.currentTimeMillis() - lastVideoPacketAt > videoStallTimeoutMs) {
-                                noVideoShown = true
-                                status("No video")
-                                runOnUiThread { noVideoImage.visibility = android.view.View.VISIBLE; syncStatusVisibility() }
+                            // normally the whole time. Two distinct cases, deliberately not
+                            // collapsed into one check:
+                            // - The codec has never actually started this session (still
+                            //   waiting on a usable key frame, or never got one at all) --
+                            //   show immediately, no delay. The box can apparently keep
+                            //   sending video-stream entries that never amount to a working
+                            //   codec (e.g. no SPS/PPS yet) while there's genuinely no
+                            //   source signal, so gating on "a frame recently started"
+                            //   here would never trip at all -- confirmed in practice (the
+                            //   test card never showed before the source was powered on).
+                            // - The codec already started successfully earlier -- gate on
+                            //   an actual elapsed gap since the last genuine frame start
+                            //   instead, so a lone stray/incomplete fragment that never
+                            //   becomes a real frame can't keep silently resetting this.
+                            if (!noVideoShown) {
+                                val shouldShow = if (!videoCodecReady) true
+                                    else System.currentTimeMillis() - lastVideoPacketAt > videoStallTimeoutMs
+                                if (shouldShow) {
+                                    noVideoShown = true
+                                    status("No video")
+                                    runOnUiThread { noVideoImage.visibility = android.view.View.VISIBLE; syncStatusVisibility() }
+                                }
                             }
                             if (e.mediaObjectOffset == 0) {
                                 if (audioAccum.size() > 0) {
@@ -2305,6 +2371,25 @@ private class MediaPacer(
 ) {
     companion object {
         private const val AUTO_CATCHUP_THRESHOLD_US = 2_000_000L
+        // How overdue a single item can be at the moment it's actually about
+        // to be dispatched before that, on its own, counts as the same kind
+        // of backlog AUTO_CATCHUP_THRESHOLD_US above catches -- except that
+        // one only sees backlog still sitting *in this queue*, measured at
+        // submit() time. Once an item is handed off (onVideoSubmit/
+        // onAudioSubmit), it stops being visible to this class at all, but
+        // video and audio don't fall behind the same way after that: video
+        // catches up for free (the decoder/Surface only ever shows whatever
+        // frame was decoded most recently, so a burst of stale backlog
+        // frames can flash by in milliseconds), while every audio sample
+        // still has to physically play out at the real sample-rate pace via
+        // AudioTrack -- so a stall that resolves before the queue itself
+        // ever grows past AUTO_CATCHUP_THRESHOLD_US can still leave audio
+        // trailing the live edge by roughly however long the stall lasted,
+        // invisible to every health metric this class exposes externally.
+        // Checking lateness here too, right where it's unavoidably visible,
+        // catches that case. Deliberately looser than AUTO_CATCHUP's 2s so
+        // ordinary jitter/cushion delay can't trip it on its own.
+        private const val DISPATCH_LATE_THRESHOLD_US = 700_000L
     }
 
     // seq is a tiebreaker for items with equal ptsUs (see queue's own
@@ -2387,6 +2472,14 @@ private class MediaPacer(
                 if (!running) break
                 if (!fastDrain) {
                     val waitUs = item.ptsUs - nowUs()
+                    // Skipped during fastDrain itself (see the `if
+                    // (!fastDrain)` just above) -- that's already an active
+                    // catch-up in progress, so checking here too would just
+                    // retrigger a fresh resync mid-drain.
+                    if (!backlogSignaled && waitUs < -DISPATCH_LATE_THRESHOLD_US) {
+                        backlogSignaled = true
+                        onBacklogExceeded()
+                    }
                     if (waitUs > 0) {
                         try {
                             Thread.sleep(waitUs / 1000, ((waitUs % 1000) * 1000).toInt())

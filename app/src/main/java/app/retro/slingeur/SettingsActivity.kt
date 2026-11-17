@@ -37,6 +37,7 @@ class SettingsActivity : Activity() {
     private lateinit var fullscreenCheck: CheckBox
     private lateinit var debugMessagesCheck: CheckBox
     private lateinit var displayTimeCheck: CheckBox
+    private lateinit var keepScreenOnCheck: CheckBox
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -66,6 +67,7 @@ class SettingsActivity : Activity() {
         fullscreenCheck = findViewById(R.id.fullscreenCheck)
         debugMessagesCheck = findViewById(R.id.debugMessagesCheck)
         displayTimeCheck = findViewById(R.id.displayTimeCheck)
+        keepScreenOnCheck = findViewById(R.id.keepScreenOnCheck)
 
         val s = AppSettings.load(this)
         resolutionSpinner.setSelection(SlingboxResolution.indexOf(s.resolution))
@@ -91,6 +93,7 @@ class SettingsActivity : Activity() {
         fullscreenCheck.isChecked = s.fullscreenEnabled
         debugMessagesCheck.isChecked = s.debugMessagesEnabled
         displayTimeCheck.isChecked = s.displayTimeEnabled
+        keepScreenOnCheck.isChecked = s.keepScreenOnEnabled
 
         findViewById<Button>(R.id.saveButton).setOnClickListener { onSave() }
         findViewById<Button>(R.id.disconnectButton).setOnClickListener { onDisconnect() }
@@ -146,7 +149,8 @@ class SettingsActivity : Activity() {
             lowLatencyHint = lowLatencyCheck.isChecked,
             fullscreenEnabled = fullscreenCheck.isChecked,
             debugMessagesEnabled = debugMessagesCheck.isChecked,
-            displayTimeEnabled = displayTimeCheck.isChecked
+            displayTimeEnabled = displayTimeCheck.isChecked,
+            keepScreenOnEnabled = keepScreenOnCheck.isChecked
         )
         AppSettings.save(this, snapshot)
         setResult(RESULT_OK)

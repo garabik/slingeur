@@ -88,6 +88,9 @@
         <CheckBox android:id="@+id/displayTimeCheck" android:layout_width="wrap_content" android:layout_height="wrap_content"
             android:text="Display current time" />
 
+        <CheckBox android:id="@+id/keepScreenOnCheck" android:layout_width="wrap_content" android:layout_height="wrap_content"
+            android:text="Keep screen on while playing" />
+
         <Button android:id="@+id/saveButton" android:layout_width="match_parent" android:layout_height="wrap_content"
             android:layout_marginTop="16dp" android:text="Save and reconnect" />
 
