@@ -168,7 +168,39 @@ class PlayerActivity : Activity(), SurfaceHolder.Callback {
     private val clockFormat = java.text.SimpleDateFormat("HH:mm", java.util.Locale.getDefault())
     private val debugTick = object : Runnable {
         override fun run() {
-            val avOffsetSec = (mediaPacer?.avOffsetUs ?: 0L) / 1_000_000.0
+            // Measured, not scheduled: AudioTrack.getTimestamp() gives the
+            // real (frame position, nanoTime) of whatever's actually
+            // audible right now, mapped back to the box's own timestamp via
+            // audioPositionTracker (see its own class doc), then advanced
+            // to "now" since that measurement itself can trail by a little.
+            // Compared directly against lastRenderedVideoPtsMs -- the box
+            // timestamp of whatever frame is actually on screen right now,
+            // held constant until the next one renders. NaN whenever any
+            // link in that chain isn't available yet (no audio track, no
+            // video frame rendered yet this session, or the device declined
+            // to give a fresh timestamp -- see AudioTrack.getTimestamp()'s
+            // own docs for when that happens, e.g. right after start()).
+            val avOffsetSec: Double = run {
+                val track = audioTrack
+                val sampleRate = audioSampleRateForTimestamp
+                val videoPtsMs = lastRenderedVideoPtsMs
+                if (track == null || sampleRate <= 0 || videoPtsMs < 0) {
+                    Double.NaN
+                } else {
+                    val ts = android.media.AudioTimestamp()
+                    if (!track.getTimestamp(ts)) {
+                        Double.NaN
+                    } else {
+                        val audiblePtsAtTsMs = audioPositionTracker.estimatePtsAtFrame(ts.framePosition, sampleRate)
+                        if (audiblePtsAtTsMs == null) {
+                            Double.NaN
+                        } else {
+                            val audiblePtsNowMs = audiblePtsAtTsMs + (System.nanoTime() - ts.nanoTime) / 1_000_000.0
+                            (audiblePtsNowMs - videoPtsMs) / 1000.0
+                        }
+                    }
+                }
+            }
             val backlogKB = (mediaPacer?.queueBytes ?: 0L) / 1024.0
             val now = System.currentTimeMillis()
             // Only re-sampled once a full second has actually elapsed (ticks
@@ -201,6 +233,34 @@ class PlayerActivity : Activity(), SurfaceHolder.Callback {
     @Volatile private var lastVideoWidth = 0
     @Volatile private var lastVideoHeight = 0
     @Volatile private var lastVideoDecoderName = ""
+
+    // Support for debugTick's measured A/V offset (see its own comment).
+    // videoPtsMatcher/audioPtsMatcher recover each decode output's original
+    // box timestamp -- pushed by submitVideoFrame/submitAudioFrame (in
+    // submission order), popped by the matching codec's own
+    // onOutputBufferAvailable (in decode-output order) -- relying on
+    // decode order matching submission order 1:1, true for both streams
+    // here since neither uses B-frame reordering. Never pushed for a codec
+    // config buffer (BUFFER_FLAG_CODEC_CONFIG submissions bypass
+    // submitVideoFrame entirely), since those never produce a matching
+    // output buffer to pop against.
+    private val videoPtsMatcher = PtsMatcher()
+    private val audioPtsMatcher = PtsMatcher()
+    // The box timestamp of whichever audio chunk popped from
+    // audioPtsMatcher most recently, as a function of AudioTrack's own
+    // frame-position counter -- see its own class doc for why this exists
+    // instead of just using the popped value directly (the frame actually
+    // audible right now is some buffer-depth behind the most recently
+    // *written* one).
+    private val audioPositionTracker = AudioPositionTracker()
+    // The box timestamp of whatever video frame is actually on screen right
+    // now -- held at that value (not reset to "unknown") until the next
+    // frame renders, same as the picture itself stays on screen until then.
+    @Volatile private var lastRenderedVideoPtsMs = -1L
+    // Sample rate audioPositionTracker's frame counts are in -- set once in
+    // setupAudioCodec, mirrored here so debugTick (not part of that
+    // function) can convert a frame count back into milliseconds.
+    @Volatile private var audioSampleRateForTimestamp = 0
 
     // Edge drags: right edge changes the device's own media volume (not an IR
     // command -- the box's own volume, if it even has one, is a separate
@@ -1476,6 +1536,10 @@ class PlayerActivity : Activity(), SurfaceHolder.Callback {
         lastRateSampleAt = 0L
         lastRateSampleBytes = 0L
         lastDisplayedRateKbps = 0.0
+        videoPtsMatcher.clear()
+        audioPtsMatcher.clear()
+        audioPositionTracker.reset()
+        lastRenderedVideoPtsMs = -1L
         // Wall-clock time a video frame last genuinely started
         // (mediaObjectOffset == 0 on the video stream) -- not updated by a
         // lone continuation fragment that never completes into a real
@@ -1499,6 +1563,9 @@ class PlayerActivity : Activity(), SurfaceHolder.Callback {
         // the codec as soon as they're reassembled, for isolating decode issues from
         // MediaPacer's real-time scheduling.
         fun submitVideoFrame(bytes: ByteArray, isKeyFrame: Boolean, boxTimeMs: Long) {
+            // Pushed regardless of pacing, so videoPtsMatcher stays correct
+            // either way -- see debugTick's measured A/V offset.
+            videoPtsMatcher.push(boxTimeMs)
             if (s.pacingEnabled) {
                 pacer.submitVideo(bytes, isKeyFrame, boxTimeMs)
             } else {
@@ -1510,6 +1577,7 @@ class PlayerActivity : Activity(), SurfaceHolder.Callback {
         // submitVideoFrame, since audio now paces through the same shared
         // queue rather than going straight to the decoder unpaced.
         fun submitAudioFrame(bytes: ByteArray, boxTimeMs: Long) {
+            audioPtsMatcher.push(boxTimeMs)
             if (s.pacingEnabled) {
                 pacer.submitAudio(bytes, boxTimeMs)
             } else {
@@ -1617,6 +1685,25 @@ class PlayerActivity : Activity(), SurfaceHolder.Callback {
                     audioTrack?.flush()
                 } catch (_: Exception) {
                 }
+                // Dropped frames here were already pushed to these matchers
+                // (submitVideoFrame/submitAudioFrame run before the pump
+                // ever sees them) but will now never reach the matching
+                // onOutputBufferAvailable to be popped -- left uncleared,
+                // every later pop would return a stale entry forever, not
+                // just until the next one arrives. A wholesale clear() is an
+                // approximation, not exact: a handful of frames may already
+                // be fed into the codec and awaiting their own output at
+                // this exact moment (not in pendingFrames, so videoPump?.
+                // clear()/audioPump?.clear() above don't touch them), and
+                // clearing out from under them can shift debugTick's
+                // measured A/V offset by a small, bounded amount (at most
+                // the codec's own input buffer depth) for the rest of the
+                // session. Not worth chasing further for a debug-only
+                // figure -- unlike actual playback, nothing here depends on
+                // getting this exactly right.
+                videoPtsMatcher.clear()
+                audioPtsMatcher.clear()
+                audioPositionTracker.reset()
                 videoStarted = false
                 requireKeyFrameToStart = true
                 status("Resynced: dropped backlog.")
@@ -1641,14 +1728,27 @@ class PlayerActivity : Activity(), SurfaceHolder.Callback {
             // Discards whatever already-decoded audio is still sitting in
             // the AudioTrack's own hardware buffer from before the jump --
             // a separate, later stage than audioPump?.clear() above (which
-            // only discards not-yet-decoded input). Harmless now regardless
-            // of AudioTrack.flush()'s exact getPlaybackHeadPosition()
-            // behavior across devices, unlike before this pacer stopped
-            // depending on that position for scheduling at all.
+            // only discards not-yet-decoded input). This pacer doesn't
+            // schedule against AudioTrack's playback position at all (see
+            // MediaPacer's own class doc for why), so flush()'s exact
+            // position-tracking behavior across devices is moot here either way.
             try {
                 audioTrack?.flush()
             } catch (_: Exception) {
             }
+            // Same reasoning as the pacing-off branch above -- everything
+            // dropToLatestKeyFrameIfBuffered() just discarded from the
+            // pacer's own queue was already pushed to these matchers too.
+            // Unlike the pacing-off branch, the exact counts are known here
+            // (the pacer just computed them, splitting what it dropped by
+            // stream) and the *kept* items (from the jumped-to key frame
+            // onward) were ALSO already pushed -- a wholesale clear() would
+            // wrongly discard those too, permanently desyncing every future
+            // pop. dropOldest() removes precisely the discarded ones and
+            // leaves the kept ones' entries in place.
+            videoPtsMatcher.dropOldest(pacer.lastDroppedVideoCount)
+            audioPtsMatcher.dropOldest(pacer.lastDroppedAudioCount)
+            audioPositionTracker.reset()
             videoStarted = false
             // The jumped-to key frame is already queued and will display on its
             // own; the *live* network reception is wherever it happens to be, with
@@ -1682,6 +1782,11 @@ class PlayerActivity : Activity(), SurfaceHolder.Callback {
             videoStarted = false
             videoAccum.reset()
             videoSettingsPaused = true
+            // Exact here, unlike doResync()'s own clear() of the same
+            // matcher: the whole codec and its callback thread are torn
+            // down above, so there's no risk of an in-flight frame's output
+            // firing late against entries pushed for whatever comes next.
+            videoPtsMatcher.clear()
         }
 
         // Re-arms video after a pauseVideoForSettings(), on this same
@@ -1786,6 +1891,7 @@ class PlayerActivity : Activity(), SurfaceHolder.Callback {
                 try { videoCodec?.release() } catch (_: Exception) {}
                 videoCodec = null
                 videoPump = null
+                videoPtsMatcher.clear()
                 videoCodecReady = false
                 videoStarted = false
                 requireKeyFrameToStart = true
@@ -1991,8 +2097,16 @@ class PlayerActivity : Activity(), SurfaceHolder.Callback {
                 pump.onInputBufferAvailable(index)
             }
             override fun onOutputBufferAvailable(mc: MediaCodec, index: Int, info: MediaCodec.BufferInfo) {
+                // Popped before releasing, in decode order -- see
+                // videoPtsMatcher's own field comment. Null is expected if
+                // this output somehow doesn't correspond to a tracked
+                // submission (shouldn't normally happen); just leaves
+                // lastRenderedVideoPtsMs showing its previous value rather
+                // than guessing.
+                val ptsMs = videoPtsMatcher.pop()
                 try {
                     mc.releaseOutputBuffer(index, true)
+                    if (ptsMs != null) lastRenderedVideoPtsMs = ptsMs
                     if (!firstVideoFrameRendered) {
                         firstVideoFrameRendered = true
                         runOnUiThread { noVideoImage.visibility = android.view.View.GONE; syncStatusVisibility() }
@@ -2117,6 +2231,11 @@ class PlayerActivity : Activity(), SurfaceHolder.Callback {
         }
         track.play()
         audioTrack = track
+        // So debugTick (outside this function) can turn
+        // AudioTrack.getTimestamp()'s frame-position counter back into
+        // milliseconds -- see audioPositionTracker's own field comment.
+        audioSampleRateForTimestamp = sampleRate
+        val bytesPerFrame = channels * 2 // ENCODING_PCM_16BIT
 
         val pump = CodecInputPump(codec)
         codec.setCallback(object : MediaCodec.Callback() {
@@ -2124,13 +2243,19 @@ class PlayerActivity : Activity(), SurfaceHolder.Callback {
                 pump.onInputBufferAvailable(index)
             }
             override fun onOutputBufferAvailable(mc: MediaCodec, index: Int, info: MediaCodec.BufferInfo) {
+                // Popped in decode order, same as video -- see
+                // videoPtsMatcher/audioPtsMatcher's shared field comment.
+                val ptsMs = audioPtsMatcher.pop()
                 try {
                     val buf = mc.getOutputBuffer(index)
                     if (buf != null && info.size > 0) {
                         val pcm = ByteArray(info.size)
                         buf.position(info.offset)
                         buf.get(pcm, 0, info.size)
-                        track.write(pcm, 0, pcm.size)
+                        val written = track.write(pcm, 0, pcm.size)
+                        if (ptsMs != null && written > 0) {
+                            audioPositionTracker.recordChunk(written / bytesPerFrame, ptsMs)
+                        }
                     }
                     mc.releaseOutputBuffer(index, false)
                 } catch (_: Exception) {
@@ -2231,6 +2356,72 @@ private enum class VideoResumeMode {
     // different resolution, so fall back to the normal cold-start wait for
     // a fresh key frame with its own SPS/PPS.
     PARAMS_CHANGED
+}
+
+/**
+ * Recovers a codec output's original box timestamp, in decode order -- see
+ * PlayerActivity's own videoPtsMatcher/audioPtsMatcher field comment for
+ * why this is tracked independently of MediaCodec's own presentationTimeUs
+ * (never set to anything meaningful here, see CodecInputPump.pump()) rather
+ * than through it. A plain FIFO, since decode output order matches
+ * submission order 1:1 for both streams in this app.
+ */
+private class PtsMatcher {
+    private val queue = java.util.concurrent.ConcurrentLinkedQueue<Long>()
+    fun push(boxTimeMs: Long) = queue.add(boxTimeMs)
+    fun pop(): Long? = queue.poll()
+    fun clear() = queue.clear()
+    /** Drops exactly the [n] oldest (earliest-pushed) entries, leaving the rest untouched. */
+    fun dropOldest(n: Int) { repeat(n) { queue.poll() } }
+}
+
+/**
+ * Maps AudioTrack.getTimestamp()'s raw frame-position counter back to the
+ * box's own timestamp for whatever's actually audible at that frame.
+ * Remembers, for each chunk written to the track, how many frames had
+ * already been written before it (since the last reset()) alongside its
+ * own box timestamp -- then, given a frame position, finds the chunk that
+ * position falls within and interpolates linearly from there using the
+ * track's sample rate. Entries are trimmed to a small bounded window: the
+ * frame actually audible can only ever be a buffer's depth behind the most
+ * recently *written* chunk, never seconds, so there's no need to keep more
+ * than a couple of seconds of chunks around.
+ */
+private class AudioPositionTracker {
+    private class Entry(val frameStart: Long, val ptsStartMs: Long)
+    private val entries = java.util.ArrayDeque<Entry>()
+    private var framesWritten = 0L
+    private val lock = Object()
+
+    fun recordChunk(frameCount: Int, ptsMs: Long) {
+        if (frameCount <= 0) return
+        synchronized(lock) {
+            entries.addLast(Entry(framesWritten, ptsMs))
+            framesWritten += frameCount
+            while (entries.size > 300) entries.removeFirst()
+        }
+    }
+
+    fun reset() {
+        synchronized(lock) {
+            entries.clear()
+            framesWritten = 0L
+        }
+    }
+
+    /** Estimated box timestamp (ms) of whatever's at [framePosition], or null if nothing recorded yet reaches back that far. */
+    fun estimatePtsAtFrame(framePosition: Long, sampleRate: Int): Double? {
+        synchronized(lock) {
+            val it = entries.descendingIterator()
+            while (it.hasNext()) {
+                val e = it.next()
+                if (e.frameStart <= framePosition) {
+                    return e.ptsStartMs + (framePosition - e.frameStart) * 1000.0 / sampleRate
+                }
+            }
+            return null
+        }
+    }
 }
 
 /**
@@ -2335,11 +2526,19 @@ private class CodecInputPump(private val codec: MediaCodec) {
  * against a real capture), translated once into this device's own
  * monotonic clock ([nowUs], System.nanoTime()-based) -- not into the audio
  * hardware's playback position, which this version deliberately avoids
- * depending on at all: AudioTrack.flush() (used on a key-frame-jump resync)
- * doesn't reliably guarantee getPlaybackHeadPosition() continues cleanly
- * across devices, and an earlier version of this class that scheduled
- * against it got bitten by exactly that, badly, after every resync.
- * System.nanoTime() has no such quirk.
+ * depending on at all. An earlier version of this class scheduled video
+ * against AudioTrack.getPlaybackHeadPosition() instead, and went badly out
+ * of sync after every resync; that got attributed to the position API not
+ * continuing cleanly across flush() on some devices, but on reflection
+ * that's not the only explanation and arguably not even the likeliest one --
+ * resyncs happened to coincide with exactly the kind of post-stall audio
+ * backlog described below, which produces the same "goes wrong right after
+ * a resync" symptom with no API involved at all, and the cushion-asymmetry
+ * bug right above was *also* live at the time, as an independently
+ * confirmed source of drift. Never re-isolated which of the three actually
+ * caused it. Doesn't matter in practice -- System.nanoTime() sidesteps the
+ * question either way -- but the API itself shouldn't be taken as guilty
+ * on this project's say-so alone.
  *
  * This still doesn't cover an actual network stall: during a stall neither
  * stream gets new data, so there's no backlog building up yet to correct.
@@ -2432,16 +2631,6 @@ private class MediaPacer(
     // tie-breaking issue, not a timing/latency one). seq as a secondary key
     // restores a stable, submission-order tiebreak for equal timestamps.
     private val queue = PriorityBlockingQueue<QueuedItem>(11, compareBy({ it.ptsUs }, { it.seq }))
-    // How far off-schedule the last VIDEO dispatch was (its target time
-    // minus the wall clock at the moment it was actually handed off).
-    // Should stay small; a persistent backlog shows up as queue depth, not
-    // as a large value here, since each item paces itself against the live
-    // clock regardless of how many others are queued behind it. No longer
-    // a literal "audio vs video" measurement the way it used to be (both
-    // streams share the same schedule by construction now, so they can't
-    // drift apart from each other) -- just a pacer-health indicator.
-    @Volatile var avOffsetUs: Long = 0
-        private set
     val queueSize: Int get() = queue.size
     // Real queued size in bytes (sum of each buffered item's actual size),
     // rather than just a count, for a backlog figure that means something
@@ -2489,7 +2678,6 @@ private class MediaPacer(
                     }
                 }
                 if (item.isVideo) onVideoSubmit(item.data) else onAudioSubmit(item.data)
-                if (item.isVideo) avOffsetUs = item.ptsUs - nowUs()
                 // Once drained to empty, normal paced dispatch resumes --
                 // offsetUs is not force-reprimed here, so this doesn't
                 // reintroduce the cushion's latency right after a resync
@@ -2554,7 +2742,6 @@ private class MediaPacer(
     /** Drops whatever's queued and resets pacing state (used on resync). */
     fun reset() {
         queue.clear()
-        avOffsetUs = 0
         backlogSignaled = false
         offsetUs = null
     }
@@ -2603,11 +2790,30 @@ private class MediaPacer(
             // Nothing to jump to -- put everything back exactly as it was.
             // This must be a true no-op on the queue, not a silent discard.
             for (f in drained) queue.add(f)
+            lastDroppedVideoCount = 0
+            lastDroppedAudioCount = 0
             return false
         }
         for (i in keyIdx until drained.size) queue.add(drained[i])
+        // What's actually being discarded here is drained[0 until keyIdx] --
+        // the caller (doResync()) needs these exact counts, split by
+        // stream, to keep PlayerActivity's own videoPtsMatcher/
+        // audioPtsMatcher in step: those were already pushed to (at
+        // submitVideoFrame/submitAudioFrame time, before this queue ever
+        // saw them) for every item in `drained`, including the ones just
+        // re-queued above -- dropping the wrong count, or from the wrong
+        // end, would desync a debug display forever rather than just for
+        // this one event.
+        lastDroppedVideoCount = (0 until keyIdx).count { drained[it].isVideo }
+        lastDroppedAudioCount = keyIdx - lastDroppedVideoCount
         return true
     }
+
+    // See dropToLatestKeyFrameIfBuffered()'s own comment just above.
+    var lastDroppedVideoCount: Int = 0
+        private set
+    var lastDroppedAudioCount: Int = 0
+        private set
 
     fun shutdown() {
         running = false

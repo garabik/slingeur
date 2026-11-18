@@ -9,6 +9,7 @@ import android.widget.EditText
 import android.widget.RadioButton
 import android.widget.RadioGroup
 import android.widget.Spinner
+import android.widget.TextView
 
 class SettingsActivity : Activity() {
 
@@ -42,6 +43,8 @@ class SettingsActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_settings)
+
+        findViewById<TextView>(R.id.buildInfoView).text = "Build no. ${BuildConfig.BUILD_TIMESTAMP}"
 
         resolutionSpinner = findViewById(R.id.resolutionSpinner)
         resolutionSpinner.adapter = ArrayAdapter(

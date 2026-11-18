@@ -13,6 +13,16 @@ android {
         targetSdk 34
         versionCode 2
         versionName "1.0"
+        // Evaluated when Gradle configures the build, i.e. once per actual
+        // build invocation -- shown in Settings (see SettingsActivity) so a
+        // installed APK's build can be told apart from another without
+        // needing a separate version bump for every iteration during
+        // development.
+        buildConfigField "String", "BUILD_TIMESTAMP", "\"${new Date().format('yyyy-MM-dd HH:mm')}\""
+    }
+
+    buildFeatures {
+        buildConfig true
     }
 
     buildTypes {
