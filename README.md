@@ -5,7 +5,7 @@ to a Slingbox, if reachable by an IP number (or DNS record); or to a
 running Gerry Dazoo's [Slinger server](https://github.com/GerryDazoo/Slinger)
 as an alternative to an existing Slinger player or `ffplay`.
 
-Current package is here: https://github.com/garabik/slingeur/releases/download/v1.0/slingeur-1.0-debug.apk
+Current package is here: https://github.com/garabik/slingeur/releases/download/v1.1/slingeur-1.1-debug.apk
 
 
 *Warning*: this is vibe-coded, with the help of Claude Sonnet 5. Claude wrote
