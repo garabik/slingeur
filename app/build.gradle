@@ -12,7 +12,7 @@ android {
         minSdk 21
         targetSdk 34
         versionCode 2
-        versionName "1.0"
+        versionName "1.1"
         // Evaluated when Gradle configures the build, i.e. once per actual
         // build invocation -- shown in Settings (see SettingsActivity) so a
         // installed APK's build can be told apart from another without

@@ -1,0 +1,10 @@
+
+2026-11-18: version 1.1
+    - improve A/V sync, but there are still issues
+    - small UI tweaks
+2026-11-11: version 1.0
+    - D-pad navigation for IR remote
+    - Android TV support
+2026-11-03: version 0.99
+    - initial release, somewhat usable
+
