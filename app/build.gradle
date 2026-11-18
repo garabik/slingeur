@@ -11,7 +11,7 @@ android {
         applicationId "app.retro.slingeur"
         minSdk 21
         targetSdk 34
-        versionCode 2
+        versionCode 3
         versionName "1.1"
         // Evaluated when Gradle configures the build, i.e. once per actual
         // build invocation -- shown in Settings (see SettingsActivity) so a
