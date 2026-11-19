@@ -83,7 +83,6 @@ class PlayerActivity : Activity(), SurfaceHolder.Callback {
     private var irFlashHideRunnable: Runnable? = null
     private lateinit var irGrid: android.view.View
     private lateinit var rootFrame: android.view.View
-    private lateinit var irOkButton: Button
 
     @Volatile private var running = false
     private var client: SlingboxClient? = null
@@ -109,19 +108,62 @@ class PlayerActivity : Activity(), SurfaceHolder.Callback {
     private var audioCodecHandler: Handler? = null
 
     // Set right before launching Settings, cleared once fully resumed --
-    // tells onPause()/surfaceDestroyed() to pause just the video decoder
-    // instead of tearing down the whole session (logout/reconnect), and
+    // tells onPause()/surfaceDestroyed() to keep the session alive across
+    // it instead of tearing the whole thing down (logout/reconnect), and
     // onActivityResult()/surfaceCreated() to resume in place instead of
-    // reconnecting from scratch. See videoPauseRequested/videoResumeMode
-    // below for how the actual pause/resume happens on the session's own
-    // thread rather than this (the main) one.
+    // reconnecting from scratch. See videoResumeMode below for how the
+    // actual resume happens, on the session's own thread rather than this
+    // (the main) one.
     private var settingsPending = false
-    // Checked once per demux-loop iteration (same pattern as
-    // resyncRequested/doResync()) so releasing videoCodec/videoPump/
-    // videoCodecThread happens on the session's own thread, not the main
-    // thread (onPause/surfaceDestroyed) racing that thread's own use of
-    // them.
-    @Volatile private var videoPauseRequested = false
+    // Set from the Settings button's own click listener (and the Menu/
+    // Settings long-press paths, which route through it), before
+    // SettingsActivity is even started -- tells the session thread to stop
+    // and release the video decoder right away, same as
+    // pauseVideoForSettings() always did, just proactively instead of
+    // reactively. Added after confirming (via logcat) that reacting in
+    // surfaceDestroyed() isn't early enough on at least one real device:
+    // its hardware decoder spontaneously corrupted itself (badly enough to
+    // need a full reboot) within single-digit milliseconds of Android
+    // abandoning the SurfaceView's BufferQueue, with no app-level call
+    // involved at that exact moment -- there's no way to react fast enough
+    // to that after the fact, only before. The actual stop()/release()
+    // still only ever runs on the session thread (see
+    // pauseVideoForSettings(), checked once per demux-loop iteration, same
+    // discipline as everywhere else touching these fields); the click
+    // listener just waits briefly on videoTeardownLatch for confirmation
+    // before actually launching SettingsActivity, so Android can't abandon
+    // the surface while the decoder's still configured against it.
+    @Volatile private var videoTeardownRequested = false
+    // Counted down once pauseVideoForSettings() (triggered by
+    // videoTeardownRequested above) actually finishes. A fresh one is
+    // created for each request (see the click listener) rather than
+    // reused, so a slow or stuck previous wait can't affect a later one.
+    @Volatile private var videoTeardownLatch: java.util.concurrent.CountDownLatch? = null
+    // Set synchronously, on the main thread, the instant surfaceDestroyed()
+    // fires -- now mostly a backstop for whenever videoTeardownRequested's
+    // own wait (see its own comment) times out before the session thread
+    // actually gets to it (a quiet connection with nothing currently
+    // arriving could leave it blocked in a socket read a little longer);
+    // the decoder is normally already stopped and released by the time
+    // this fires at all. Still worth keeping regardless: the video codec's
+    // own callback thread (videoCodecHandler, a different thread again)
+    // could otherwise still fire onOutputBufferAvailable for a frame that
+    // was already mid-decode, and that callback calling
+    // releaseOutputBuffer(index, true) against an already-torn-down
+    // surface is exactly the kind of thing that corrupted a real device's
+    // hardware decoder badly enough to need a full reboot (confirmed via
+    // logcat). onOutputBufferAvailable checks this and releases with
+    // render=false instead whenever it's set, which never touches the
+    // BufferQueue at all and so can't race it.
+    //
+    // Deliberately NOT cleared back in onPlayerSurfaceAvailable() the same
+    // synchronous way it's set -- clearing it has to wait until video is
+    // actually reattached to (or recreated against) the new surface, which
+    // only happens later, on the session thread (resumeVideoForSettings()/
+    // runSession()'s own per-session reset) -- see those for where this
+    // actually gets cleared, and onPlayerSurfaceAvailable()'s own comment
+    // for why clearing it that early would reopen the same race.
+    @Volatile private var videoSurfaceGone = false
     // Likewise for resuming -- NONE means no resume pending, otherwise
     // which of the two strategies to use. See runSession's
     // resumeVideoForSettings() for what each one actually does.
@@ -168,6 +210,7 @@ class PlayerActivity : Activity(), SurfaceHolder.Callback {
     private val clockFormat = java.text.SimpleDateFormat("HH:mm", java.util.Locale.getDefault())
     private val debugTick = object : Runnable {
         override fun run() {
+            val now = System.currentTimeMillis()
             // Measured, not scheduled: AudioTrack.getTimestamp() gives the
             // real (frame position, nanoTime) of whatever's actually
             // audible right now, mapped back to the box's own timestamp via
@@ -196,13 +239,82 @@ class PlayerActivity : Activity(), SurfaceHolder.Callback {
                             Double.NaN
                         } else {
                             val audiblePtsNowMs = audiblePtsAtTsMs + (System.nanoTime() - ts.nanoTime) / 1_000_000.0
-                            (audiblePtsNowMs - videoPtsMs) / 1000.0
+                            val raw = (audiblePtsNowMs - videoPtsMs) / 1000.0
+                            // Treated as untrustworthy, not as a real
+                            // reading, past this point -- confirmed in
+                            // practice as reaching ~150s while actual
+                            // playback looked properly in sync, so this
+                            // isn't "a real, severe lag", it's the
+                            // measurement chain itself having glitched
+                            // (most likely audioPositionTracker's frame
+                            // position bookkeeping losing track after
+                            // repeated resyncs under sustained decode
+                            // backlog -- see doResync()'s own "draining"
+                            // branch, now fixed, which is the actual
+                            // underlying bug that let this run long enough
+                            // to show up at all). A real, uncorrected lag
+                            // should never organically reach this size
+                            // either way: the resync trigger below already
+                            // acts well before it could.
+                            if (kotlin.math.abs(raw) > AV_OFFSET_SANITY_LIMIT_SEC) Double.NaN else raw
                         }
                     }
                 }
             }
+            // Catches decode-side lag, not just network stalls -- e.g. a
+            // software decoder too slow to keep up with real time on weak
+            // hardware (confirmed in practice: video fell seconds behind
+            // while hardware-decoded audio stayed fine). MediaPacer's own
+            // stall detection can't see this at all -- it only watches its
+            // own queue, measured before an item is handed off to
+            // videoPump, and a slow decoder still drains that queue right
+            // on schedule; the backlog it can't actually work through
+            // piles up invisibly inside CodecInputPump's own pending-frame
+            // queue instead, somewhere this class has no visibility into.
+            // avOffsetSec, uniquely, measures the real rendered result
+            // regardless of where the backlog is physically sitting, so
+            // reusing it as the trigger needs no separate decode-side
+            // instrumentation. Reuses the exact same doResync() a network
+            // stall already triggers, including flushing audio -- not
+            // actually necessary here (audio was never behind), but
+            // harmless, and far simpler than building a video-only drop
+            // path just for this. now - lastResyncAtMs is a plain cooldown
+            // so this can't immediately retrigger itself while the just-
+            // resynced decoder is still catching back up.
+            //
+            // Checked by magnitude (abs), not just a positive offset --
+            // audio can fall behind video too (e.g. an audio-side decode
+            // hiccup), and there was never a real reason this trigger only
+            // watched one direction; it was just never generalized when
+            // first added for the video-lagging case specifically.
+            if (!avOffsetSec.isNaN() && kotlin.math.abs(avOffsetSec) > 1.5 && now - lastResyncAtMs > 3000) {
+                resyncRequested = true
+            } else if (!avOffsetSec.isNaN()) {
+                // Slow drift correction for a steady (not stall-sized) bias
+                // -- e.g. a fixed output-latency mismatch between the
+                // video and audio pipelines on a given device, confirmed
+                // in practice as video sitting ~0.4-1s behind on an
+                // otherwise healthy connection. A damped proportional
+                // nudge (not a straight jump to the measured value) so a
+                // single noisy reading can't cause a visible stutter: each
+                // tick closes part of the current gap, capped per tick,
+                // and MediaPacer.submit() applies the running total only
+                // to video's own schedule -- see its own field comment.
+                // Deliberately no integral or derivative term: the
+                // measured offset directly IS the error being corrected
+                // (nothing else is pulling it away at steady state, so a
+                // plain proportional term already converges to ~zero), and
+                // the correction takes effect with no real lag/momentum to
+                // anticipate -- the per-tick cap already does the job a
+                // derivative term would.
+                mediaPacer?.let { pacer ->
+                    val measuredOffsetUs = (avOffsetSec * 1_000_000.0).toLong()
+                    val current = pacer.videoScheduleCorrectionUs
+                    val step = ((measuredOffsetUs - current) * 0.18).toLong().coerceIn(-25_000L, 25_000L)
+                    pacer.videoScheduleCorrectionUs = (current + step).coerceIn(-1_500_000L, 1_500_000L)
+                }
+            }
             val backlogKB = (mediaPacer?.queueBytes ?: 0L) / 1024.0
-            val now = System.currentTimeMillis()
             // Only re-sampled once a full second has actually elapsed (ticks
             // in between just keep showing the last computed value), so this
             // reads as a stable per-second rate rather than jittering with
@@ -354,7 +466,6 @@ class PlayerActivity : Activity(), SurfaceHolder.Callback {
         // A stable, always-present focus target to hand D-pad focus back to
         // whenever the remote hides -- see showControls/hideControls.
         rootFrame.isFocusable = true
-        irOkButton = findViewById(R.id.irOkButton)
         applyAspectRatio()
         applyDebugVisibility()
         applyClockVisibility()
@@ -378,6 +489,22 @@ class PlayerActivity : Activity(), SurfaceHolder.Callback {
             // session, audio decode/playback) keep running underneath
             // instead of a full logout+reconnect while Settings is up.
             settingsPending = true
+            // See videoTeardownRequested's own comment -- stop/release the
+            // video decoder now, before SettingsActivity (and so Android
+            // abandoning this surface) even starts, and wait briefly for
+            // confirmation that actually happened. Bounded: on a quiet
+            // connection the session thread could still be blocked in a
+            // socket read when this fires and not notice the request for
+            // a little while -- in that case this just times out and
+            // launches Settings anyway, exactly the same (already
+            // accepted) risk level as before this existed, never worse.
+            val latch = java.util.concurrent.CountDownLatch(1)
+            videoTeardownLatch = latch
+            videoTeardownRequested = true
+            try {
+                latch.await(600, java.util.concurrent.TimeUnit.MILLISECONDS)
+            } catch (_: InterruptedException) {
+            }
             startActivityForResult(Intent(this, SettingsActivity::class.java), SETTINGS_REQUEST_CODE)
         }
         aspectButton.setOnClickListener { cycleAspectRatio() }
@@ -452,6 +579,10 @@ class PlayerActivity : Activity(), SurfaceHolder.Callback {
             KeyEvent.KEYCODE_DPAD_DOWN -> 39
             KeyEvent.KEYCODE_PAGE_UP -> 44
             KeyEvent.KEYCODE_PAGE_DOWN -> 43
+            // The physical/remote Menu key itself -- same IR code as the
+            // M-key fallback below, but handled as its own case since it
+            // also needs long-press tracking (see onKeyDown/onKeyLongPress).
+            KeyEvent.KEYCODE_MENU -> 33
             // M/m and G/g are each two different buttons depending on shift,
             // exactly like the reference keyMap's 'M'/'m' and 'G'/'g' entries.
             KeyEvent.KEYCODE_M -> if (shift) 8 else 33 // Mute / Menu
@@ -509,12 +640,19 @@ class PlayerActivity : Activity(), SurfaceHolder.Callback {
             }
         }
         if (event.repeatCount == 0) {
-            // Tab/Menu open this app's own Settings rather than being an IR
-            // code -- Menu in particular is the physical/remote "options"
-            // key on many Android TV-ish keyboards and remotes, a natural
-            // fit for it here.
-            if (keyCode == KeyEvent.KEYCODE_TAB || keyCode == KeyEvent.KEYCODE_MENU) {
+            // Tab opens this app's own Settings directly -- a keyboard-only
+            // convenience key with no IR meaning of its own, unlike Menu
+            // below (which does have a real box IR code).
+            if (keyCode == KeyEvent.KEYCODE_TAB) {
                 settingsButton.performClick()
+                return true
+            }
+            // Settings (the dedicated key some Android TV remotes have) has
+            // no box IR code of its own -- short press does nothing but arm
+            // long-press tracking (see onKeyLongPress, where the actual
+            // "open Settings" action lives, same as Menu's long-press).
+            if (keyCode == KeyEvent.KEYCODE_SETTINGS) {
+                event.startTracking()
                 return true
             }
             // A single physical/remote "Zoom" key cycles through the same
@@ -528,8 +666,11 @@ class PlayerActivity : Activity(), SurfaceHolder.Callback {
                 return true
             }
             // Same as tapping the video: toggles the remote/top bar and
-            // requests a resync.
+            // requests a resync. Also arms long-press tracking -- holding C
+            // brings the remote up in D-pad-navigable mode instead (see
+            // onKeyLongPress), same as long-pressing OK.
             if (keyCode == KeyEvent.KEYCODE_C) {
+                event.startTracking()
                 onTap()
                 return true
             }
@@ -568,7 +709,7 @@ class PlayerActivity : Activity(), SurfaceHolder.Callback {
             if (!(isDpadNavKey && remoteIsDpadNavigable())) {
                 val code = irCodeForKeyEvent(event)
                 if (code != null) {
-                    // DPAD_CENTER/ENTER send their short-press OK code
+                    // DPAD_CENTER/ENTER/MENU send their short-press IR code
                     // immediately here either way, but also need to arm the
                     // framework's own long-press tracking (see
                     // onKeyLongPress) -- returning true without calling
@@ -577,7 +718,8 @@ class PlayerActivity : Activity(), SurfaceHolder.Callback {
                     // unarmed, since KeyEvent.dispatch() only starts
                     // tracking a key when the handler that consumed its
                     // first down event explicitly asked it to.
-                    if (keyCode == KeyEvent.KEYCODE_DPAD_CENTER || keyCode == KeyEvent.KEYCODE_ENTER) {
+                    if (keyCode == KeyEvent.KEYCODE_DPAD_CENTER || keyCode == KeyEvent.KEYCODE_ENTER ||
+                        keyCode == KeyEvent.KEYCODE_MENU) {
                         event.startTracking()
                     }
                     sendIr(code.toString())
@@ -592,17 +734,28 @@ class PlayerActivity : Activity(), SurfaceHolder.Callback {
         irGrid.visibility == android.view.View.VISIBLE &&
             (irGrid as ViewGroup).descendantFocusability == ViewGroup.FOCUS_BEFORE_DESCENDANTS
 
-    // Long-pressing OK brings the remote forward -- an easy, always-present
-    // way to do that on an Android TV remote, which typically has only a
-    // D-pad, OK, Back, Home and a numeric keypad, none of the other keys
-    // this app maps (letters, Tab, c, etc.) on a full keyboard. A short
-    // press still sends the box's own OK code immediately either way (see
-    // onKeyDown above); this just additionally triggers once the system's
-    // own long-press timer fires if the key is held, same as a long-press
-    // on Home/Back elsewhere in Android.
+    // Long-pressing OK (or C) brings the remote forward -- an easy, always-
+    // present way to do that on an Android TV remote, which typically has
+    // only a D-pad, OK, Back, Home and a numeric keypad, none of the other
+    // keys this app maps (letters, Tab, etc.) on a full keyboard. A short
+    // press of OK still sends the box's own OK code immediately either way
+    // (see onKeyDown above; C's short press toggles the remote via onTap()
+    // instead); this just additionally triggers once the system's own
+    // long-press timer fires if the key is held, same as a long-press on
+    // Home/Back elsewhere in Android.
+    //
+    // Long-pressing Menu or Settings opens this app's own Settings instead
+    // -- Menu's short press sends the box's own Menu IR code either way
+    // (see onKeyDown/irCodeForKeyEvent), same relationship as OK above;
+    // Settings has no box IR code at all, so its short press does nothing.
     override fun onKeyLongPress(keyCode: Int, event: KeyEvent): Boolean {
-        if (keyCode == KeyEvent.KEYCODE_DPAD_CENTER || keyCode == KeyEvent.KEYCODE_ENTER) {
+        if (keyCode == KeyEvent.KEYCODE_DPAD_CENTER || keyCode == KeyEvent.KEYCODE_ENTER ||
+            keyCode == KeyEvent.KEYCODE_C) {
             onLongPressShowRemote()
+            return true
+        }
+        if (keyCode == KeyEvent.KEYCODE_MENU || keyCode == KeyEvent.KEYCODE_SETTINGS) {
+            settingsButton.performClick()
             return true
         }
         return super.onKeyLongPress(keyCode, event)
@@ -681,10 +834,16 @@ class PlayerActivity : Activity(), SurfaceHolder.Callback {
     // follows the "Show debug messages" setting instead of disappearing
     // outright: on means it stays up permanently, off means it only shows
     // with the rest of the controls. See applyDebugVisibility/hideControls.
-    // dpadFocus=true (only from long-pressing OK -- see onKeyLongPress)
-    // switches the remote into a genuinely D-pad-navigable mode: the buttons
-    // become reachable by focus-search and OK starts focused. Everywhere
-    // else that shows the remote (tap, 'c', zoom key, etc.) leaves it false,
+    // dpadFocus=true (only from long-pressing OK/C/Menu -- see
+    // onKeyLongPress) switches the remote into a genuinely D-pad-navigable
+    // mode: the buttons become reachable by focus-search, with Aspect
+    // starting focused -- deliberately not OK, since a long-press's own
+    // key-up is occasionally delivered as an extra click on whatever
+    // currently has focus, which would otherwise fire a spurious OK IR
+    // send every time (confirmed in practice); Aspect's own click handler
+    // just re-cycles the aspect ratio locally, harmless if it fires
+    // spuriously the same way. Everywhere else that shows the remote (tap,
+    // zoom key, etc. -- not navigably) leaves this false,
     // which keeps a stock device's physical/HW keyboard working exactly as
     // before while the remote happens to be visible, since
     // FOCUS_BLOCK_DESCENDANTS (set in onCreate, restored on hide below)
@@ -696,7 +855,7 @@ class PlayerActivity : Activity(), SurfaceHolder.Callback {
         syncStatusVisibility()
         if (dpadFocus) {
             (irGrid as ViewGroup).descendantFocusability = ViewGroup.FOCUS_BEFORE_DESCENDANTS
-            irOkButton.requestFocus()
+            aspectButton.requestFocus()
         }
         scheduleHideControls()
     }
@@ -864,6 +1023,12 @@ class PlayerActivity : Activity(), SurfaceHolder.Callback {
     // (running is already true by then) and settingsPending is already
     // false by then too.
     private fun onPlayerSurfaceAvailable() {
+        // videoSurfaceGone itself is NOT cleared here -- unlike setting it
+        // true in surfaceDestroyed(), clearing it has to wait until the
+        // decoder is actually recreated against this new surface, which
+        // happens later, on the session thread, inside
+        // resumeVideoForSettings()/runSession()'s own reset. See
+        // videoSurfaceGone's own field comment.
         if (settingsPending && running) {
             // Resuming from Settings with the session kept alive the whole
             // time -- just re-arm video (see resumeVideoForSettings, run on
@@ -883,15 +1048,23 @@ class PlayerActivity : Activity(), SurfaceHolder.Callback {
     override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {}
 
     override fun surfaceDestroyed(holder: SurfaceHolder) {
-        if (settingsPending && running) {
-            // Settings is covering the screen -- Android is tearing this
-            // surface down as a normal consequence of that, same as it
-            // always would, but that no longer needs to mean stopping the
-            // whole session: pause just the video decoder (on the
-            // session's own thread, see videoPauseRequested), leaving the
-            // network session and audio alone.
-            videoPauseRequested = true
-        } else {
+        // See videoSurfaceGone's own field comment -- set synchronously,
+        // right here, before anything else, regardless of which branch
+        // below runs: unlike stopPlayback() (deferred to the session
+        // thread's own loop) or Settings itself even finishing opening,
+        // this needs to take effect immediately.
+        videoSurfaceGone = true
+        // Settings covering the screen is the only other case Android
+        // tears this surface down for while still running -- normally
+        // nothing further is needed here for that case specifically: the
+        // Settings button's own click listener already stopped and
+        // released the video decoder proactively, before SettingsActivity
+        // (and so this surface teardown) even started -- see
+        // videoTeardownRequested's own field comment for why reacting here
+        // instead isn't fast enough on at least one real device. This stays
+        // regardless, as a backstop for whenever that proactive attempt's
+        // bounded wait timed out first.
+        if (!(settingsPending && running)) {
             stopPlayback()
         }
     }
@@ -992,6 +1165,11 @@ class PlayerActivity : Activity(), SurfaceHolder.Callback {
         private const val MAX_ZOOM = 4f
         private const val PINCH_COOLDOWN_MS = 400L
         private const val ARROW_PAN_STEP_DP = 40f
+        // Past this, debugTick's measured A/V offset is treated as a
+        // glitched reading, not a real one -- see its own comment at the
+        // point it's applied. Generous: well above anything a working
+        // resync should ever let a genuine lag reach.
+        private const val AV_OFFSET_SANITY_LIMIT_SEC = 30.0
     }
 
     // Re-clamps pan to whatever the current zoom level actually allows (the
@@ -1189,13 +1367,23 @@ class PlayerActivity : Activity(), SurfaceHolder.Callback {
         }
     }
 
-    // Same show/hide toggle as onTap(), but for the long-press-OK trigger
+    // Same show/hide toggle as onTap(), but for the long-press-OK/C trigger
     // (see onKeyLongPress): shows the remote in D-pad-navigable mode, since
     // that's the one case (TV remote with no other way to reach most
     // buttons) where grabbing focus is actually wanted.
+    //
+    // Checks remoteIsDpadNavigable(), not plain visibility -- C's own short
+    // press (onTap(), which always fires first regardless of how long the
+    // key ends up held, same as OK's short press always sends its IR code
+    // first) can already have shown the remote in plain mode by the time
+    // this fires. Toggling off whatever onTap() just toggled on would make
+    // a held C flash the remote open then immediately closed instead of
+    // landing on navigable mode; checking navigability specifically means
+    // this always *upgrades* a plain-mode remote to navigable instead,
+    // and only acts as a close when it's already navigable.
     private fun onLongPressShowRemote() {
         resyncRequested = true
-        if (debugOverlay.visibility == android.view.View.VISIBLE) {
+        if (remoteIsDpadNavigable()) {
             hideControls()
         } else {
             showControls(dpadFocus = true)
@@ -1410,9 +1598,8 @@ class PlayerActivity : Activity(), SurfaceHolder.Callback {
         cachedPps = null
         // Stale values from a previous session shouldn't leak into a brand
         // new one -- e.g. if that session died while Settings happened to
-        // be open, these could otherwise still be set when this fresh
+        // be open, this could otherwise still be set when this fresh
         // session's loop starts.
-        videoPauseRequested = false
         videoResumeMode = VideoResumeMode.NONE
 
         val c = SlingboxClient(s.host, s.port, s.password, log = { status(it) })
@@ -1540,6 +1727,13 @@ class PlayerActivity : Activity(), SurfaceHolder.Callback {
         audioPtsMatcher.clear()
         audioPositionTracker.reset()
         lastRenderedVideoPtsMs = -1L
+        // A fresh session always has a valid, just-created surface to
+        // render to by now (PlayerActivity's own SurfaceView, laid out
+        // well before any network data arrives) -- reset here regardless
+        // of how this got left from whatever the previous session (if
+        // any) was doing, same reasoning as the other sessions-start
+        // resets just above.
+        videoSurfaceGone = false
         // Wall-clock time a video frame last genuinely started
         // (mediaObjectOffset == 0 on the video stream) -- not updated by a
         // lone continuation fragment that never completes into a real
@@ -1703,21 +1897,48 @@ class PlayerActivity : Activity(), SurfaceHolder.Callback {
                 // getting this exactly right.
                 videoPtsMatcher.clear()
                 audioPtsMatcher.clear()
-                audioPositionTracker.reset()
+                // audioPositionTracker is deliberately NOT reset here --
+                // see its own call site comment a few branches down for
+                // why that would be actively wrong, not just unnecessary.
                 videoStarted = false
                 requireKeyFrameToStart = true
                 status("Resynced: dropped backlog.")
                 return
             }
             if (!pacer.dropToLatestKeyFrameIfBuffered()) {
-                // Nothing to jump to -- still worth draining the deliberate
-                // buffer cushion (see MediaPacer's cushionUs) quickly rather
-                // than doing nothing, so a tap/keypress resync recovers that
-                // added latency even without a key frame to jump ahead to.
-                // Nothing is dropped, so this is safe even with no buffer
-                // configured (cushionUs=0) or pacing off (pacer unused).
+                // Nothing to jump to in the pacer's own queue -- still
+                // worth draining the deliberate buffer cushion (see
+                // MediaPacer's cushionUs) quickly rather than doing
+                // nothing, so a tap/keypress resync recovers that added
+                // latency even without a key frame to jump ahead to.
                 lastResyncKind = "draining"
                 pacer.fastDrainBuffer()
+                // A decode-side bottleneck (see debugTick's own
+                // avOffsetSec-driven trigger) backs up *here* -- in
+                // videoPump's own pending-frame queue, not in the pacer's
+                // queue at all, since the pacer dispatches its own items
+                // on schedule regardless of whether the decoder can
+                // actually keep up with them afterward. This branch (no
+                // keyframe buffered in the pacer) is the overwhelmingly
+                // common one for that specific case, and this used to be
+                // a complete no-op for it -- the backlog just kept
+                // growing, unbounded, through every single resync.
+                // Confirmed in practice: debugTick's measured A/V offset
+                // reaching ~150s while actual playback looked properly in
+                // sync at the time -- i.e. a real backlog that was never
+                // actually being corrected, not a glitched reading (see
+                // AV_OFFSET_SANITY_LIMIT_SEC's own comment). Audio is
+                // deliberately untouched here, unlike the other two
+                // branches -- this bottleneck is specifically a
+                // video-decode one, and a harmless no-op in the original,
+                // buffer-cushion-only case this branch was written for,
+                // since there's nothing queued in videoPump to drop then
+                // either.
+                videoAccum.reset()
+                videoPump?.clear()
+                videoPtsMatcher.clear()
+                videoStarted = false
+                requireKeyFrameToStart = true
                 return
             }
             lastResyncKind = "skip to keyframe"
@@ -1731,7 +1952,11 @@ class PlayerActivity : Activity(), SurfaceHolder.Callback {
             // only discards not-yet-decoded input). This pacer doesn't
             // schedule against AudioTrack's playback position at all (see
             // MediaPacer's own class doc for why), so flush()'s exact
-            // position-tracking behavior across devices is moot here either way.
+            // position-tracking behavior across devices doesn't affect
+            // pacing -- but audioPositionTracker (added later, for
+            // debugTick's measured A/V offset) does read that position,
+            // so it's NOT moot for that purpose -- see the comment just
+            // below, where this bit it in practice.
             try {
                 audioTrack?.flush()
             } catch (_: Exception) {
@@ -1748,7 +1973,26 @@ class PlayerActivity : Activity(), SurfaceHolder.Callback {
             // leaves the kept ones' entries in place.
             videoPtsMatcher.dropOldest(pacer.lastDroppedVideoCount)
             audioPtsMatcher.dropOldest(pacer.lastDroppedAudioCount)
-            audioPositionTracker.reset()
+            // audioPositionTracker itself is deliberately NOT reset here,
+            // unlike the matchers just above -- AudioTrack.flush() does
+            // NOT reset the frame-position counter getTimestamp() (and
+            // getPlaybackHeadPosition() before it) reports: per Android's
+            // own documented semantics, that counter reflects cumulative
+            // frames actually played since the track was created, and
+            // flush() only discards queued-but-not-yet-played data -- it
+            // keeps right on counting from its old value regardless.
+            // Resetting THIS tracker's own framesWritten to 0 here while
+            // the real device counter kept its true (large, however long
+            // the track had already been running) value is exactly what
+            // produced huge, bogus measured-offset jumps confirmed in
+            // practice (+150s, +300s) -- every later estimatePtsAtFrame()
+            // call matched the device's real, large framePosition against
+            // entries that all started back near frame 0, extrapolating a
+            // wildly inflated result. Leaving it alone here means it just
+            // keeps tracking the same ongoing count the device itself
+            // does, which stays correct across a flush() -- only a brand
+            // new AudioTrack instance (runSession's own per-session reset)
+            // actually starts a fresh count at 0.
             videoStarted = false
             // The jumped-to key frame is already queued and will display on its
             // own; the *live* network reception is wherever it happens to be, with
@@ -1762,18 +2006,54 @@ class PlayerActivity : Activity(), SurfaceHolder.Callback {
 
         // Releases just the video decoder (codec/pump/callback thread),
         // leaving the control connection, audio decode/playback, and this
-        // very demux loop completely untouched -- used when Settings covers
-        // the screen and SurfaceView's own surface gets torn down as a
-        // result (see PlayerActivity.surfaceDestroyed/onPause). Runs here,
-        // on this session's own thread (triggered via videoPauseRequested,
-        // checked below, same pattern as doResync()/resyncRequested),
-        // specifically so this never races the main thread releasing the
-        // same fields concurrently.
+        // very demux loop completely untouched. Called from two places:
+        // proactively, via videoTeardownRequested (checked in the main
+        // loop below), triggered by the Settings button's own click
+        // listener before SettingsActivity even starts -- the normal path
+        // now, confirmed necessary since reacting afterward isn't fast
+        // enough on at least one real device (see videoTeardownRequested's
+        // own field comment); and defensively, at the top of
+        // resumeVideoForSettings(), in case that proactive attempt's
+        // bounded wait timed out before this got a chance to run. Runs
+        // here either way, on this session's own thread, so it never races
+        // the main thread's own use of these same fields.
         fun pauseVideoForSettings() {
             videoPump?.clear()
             videoPump = null
-            try { videoCodec?.stop() } catch (_: Exception) {}
-            try { videoCodec?.release() } catch (_: Exception) {}
+            // stop()/release() are posted onto videoCodecHandler itself --
+            // the SAME thread that runs this codec's own onInputBuffer/
+            // onOutputBufferAvailable callbacks -- rather than called
+            // directly here on the session thread, and this call waits
+            // (bounded) for that posted work to actually finish before
+            // doing anything else below. MediaCodec is explicitly not
+            // thread-safe for concurrent calls from two different threads,
+            // and calling stop() here directly used to do exactly that:
+            // confirmed via logcat as a real failure on at least one
+            // device, where an onOutputBufferAvailable call already queued
+            // on videoCodecHandler fired its own releaseOutputBuffer() at
+            // the same moment this thread called stop(), corrupting the
+            // hardware codec -- notably, before Settings' own window even
+            // started covering anything, so not the surface-abandonment
+            // race fixed earlier at all; a distinct, longer-standing bug
+            // in this teardown path itself. Posting to videoCodecHandler
+            // guarantees strict ordering: Handler processes one message at
+            // a time, so this can never run while that thread is still
+            // inside (or has yet to run) an already-queued callback for
+            // the same codec instance.
+            val codec = videoCodec
+            val handler = videoCodecHandler
+            if (codec != null && handler != null) {
+                val latch = java.util.concurrent.CountDownLatch(1)
+                handler.post {
+                    try { codec.stop() } catch (_: Exception) {}
+                    try { codec.release() } catch (_: Exception) {}
+                    latch.countDown()
+                }
+                try {
+                    latch.await(2, java.util.concurrent.TimeUnit.SECONDS)
+                } catch (_: InterruptedException) {
+                }
+            }
             videoCodec = null
             videoCodecThread?.quitSafely()
             videoCodecThread = null
@@ -1811,8 +2091,11 @@ class PlayerActivity : Activity(), SurfaceHolder.Callback {
         //   resolution.
         fun resumeVideoForSettings(mode: VideoResumeMode) {
             // Defensive: don't assume pauseVideoForSettings() already ran --
-            // its trigger (surfaceDestroyed) isn't guaranteed to fire for
-            // every Settings-open on every device/timing. Release whatever
+            // its usual trigger (videoTeardownRequested, from the Settings
+            // button's own click listener) waits for confirmation with a
+            // bounded timeout, not an unbounded one, so it isn't guaranteed
+            // to have actually finished by the time this runs on every
+            // device/timing. Release whatever
             // video state is still there first, unconditionally, before
             // creating anything new. This matters: creating a second
             // hardware decoder instance while an old one is still alive can
@@ -1826,6 +2109,11 @@ class PlayerActivity : Activity(), SurfaceHolder.Callback {
             // happen, independent of whether stream parameters changed.
             try {
                 pauseVideoForSettings()
+                // pauseVideoForSettings() just released whatever codec
+                // existed -- nothing can fire a stale callback against the
+                // old surface anymore, so it's safe to clear this now, well
+                // before the new codec created below even exists yet.
+                videoSurfaceGone = false
                 // pauseVideoForSettings() just set this true -- clear it
                 // right away, since this function's whole job from here on
                 // is re-arming video, and every path below (including the
@@ -1864,8 +2152,22 @@ class PlayerActivity : Activity(), SurfaceHolder.Callback {
                 } else {
                     val sps = cachedSps
                     val pps = cachedPps
-                    if (sps != null && pps != null) {
-                        val fresh = AppSettings.load(this)
+                    val fresh = AppSettings.load(this)
+                    // "Fast video relaunch" (Settings, off by default): the
+                    // instant-restart-with-cached-SPS/PPS path below feeds
+                    // the recreated decoder whatever arrives next, delta
+                    // frame or key frame alike, with no reference picture
+                    // of its own yet -- expected to just look corrupted
+                    // for a few frames until the next real key frame. Off
+                    // means always falling through to the cold-start wait
+                    // instead, same as if nothing were cached at all, at
+                    // the cost of a few extra seconds of black screen.
+                    // Confirmed in practice as worth making optional: at
+                    // least one real device's hardware decoder can get
+                    // stuck this way instead of self-correcting as
+                    // expected, leaving video frozen for the rest of the
+                    // session (see AppSettings.Snapshot's own comment).
+                    if (sps != null && pps != null && fresh.fastVideoRelaunchEnabled) {
                         setupVideoCodec(vWidth, vHeight, fresh.videoDecoder, fresh.lowLatencyHint)
                         videoCodec!!.start()
                         videoCodecReady = true
@@ -1876,8 +2178,9 @@ class PlayerActivity : Activity(), SurfaceHolder.Callback {
                         return
                     }
                     // No cached SPS/PPS (video never actually started this
-                    // session, e.g. it was audio-only the whole time) --
-                    // fall through to the normal cold-start wait below.
+                    // session, e.g. it was audio-only the whole time), or
+                    // fast relaunch is off -- fall through to the normal
+                    // cold-start wait below either way.
                 }
                 videoCodecReady = false
                 videoStarted = false
@@ -1892,6 +2195,9 @@ class PlayerActivity : Activity(), SurfaceHolder.Callback {
                 videoCodec = null
                 videoPump = null
                 videoPtsMatcher.clear()
+                // No live codec left either way after the release just
+                // above -- safe to clear regardless of which branch threw.
+                videoSurfaceGone = false
                 videoCodecReady = false
                 videoStarted = false
                 requireKeyFrameToStart = true
@@ -1905,8 +2211,8 @@ class PlayerActivity : Activity(), SurfaceHolder.Callback {
                     resyncRequested = false
                     doResync()
                 }
-                if (videoPauseRequested) {
-                    videoPauseRequested = false
+                if (videoTeardownRequested) {
+                    videoTeardownRequested = false
                     // Same reasoning as resumeVideoForSettings's own
                     // try/catch -- this runs directly in the main loop, not
                     // inside readAndDemuxPacket's own try/catch, so an
@@ -1916,8 +2222,11 @@ class PlayerActivity : Activity(), SurfaceHolder.Callback {
                     try {
                         pauseVideoForSettings()
                     } catch (e: Exception) {
-                        android.util.Log.e("SlingboxPlayer", "pauseVideoForSettings failed", e)
+                        android.util.Log.e("SlingboxPlayer", "pauseVideoForSettings (proactive) failed", e)
                     }
+                    // Lets the click listener's bounded wait return early
+                    // instead of always sitting out the full timeout.
+                    videoTeardownLatch?.countDown()
                 }
                 val resumeMode = videoResumeMode
                 if (resumeMode != VideoResumeMode.NONE) {
@@ -2105,11 +2414,26 @@ class PlayerActivity : Activity(), SurfaceHolder.Callback {
                 // than guessing.
                 val ptsMs = videoPtsMatcher.pop()
                 try {
-                    mc.releaseOutputBuffer(index, true)
-                    if (ptsMs != null) lastRenderedVideoPtsMs = ptsMs
-                    if (!firstVideoFrameRendered) {
-                        firstVideoFrameRendered = true
-                        runOnUiThread { noVideoImage.visibility = android.view.View.GONE; syncStatusVisibility() }
+                    if (videoSurfaceGone) {
+                        // See videoSurfaceGone's own field comment -- the
+                        // surface this codec was configured against is
+                        // already torn down (surfaceDestroyed() already
+                        // fired, synchronously, on the main thread), so
+                        // actually rendering (render=true) would push into
+                        // an already-disconnected BufferQueue. render=false
+                        // never touches it at all, just hands the buffer
+                        // back to the codec -- safe regardless of the
+                        // surface's state, confirmed the hard way that the
+                        // alternative isn't on at least one device (see
+                        // that comment for specifics).
+                        mc.releaseOutputBuffer(index, false)
+                    } else {
+                        mc.releaseOutputBuffer(index, true)
+                        if (ptsMs != null) lastRenderedVideoPtsMs = ptsMs
+                        if (!firstVideoFrameRendered) {
+                            firstVideoFrameRendered = true
+                            runOnUiThread { noVideoImage.visibility = android.view.View.GONE; syncStatusVisibility() }
+                        }
                     }
                 } catch (e: Exception) {
                     android.util.Log.e("SlingboxPlayer", "[video] releaseOutputBuffer failed", e)
@@ -2347,9 +2671,15 @@ private fun buildAnnexB(nals: List<Pair<Int, ByteArray>>, excludeTypes: Set<Int>
  */
 private enum class VideoResumeMode {
     NONE,
-    // Settings closed without changing anything stream-affecting -- restart
-    // the decoder immediately with the cached SPS/PPS and feed it whatever
-    // arrives next.
+    // Settings closed without changing anything stream-affecting --
+    // restart the decoder (a new hardware instance) immediately with the
+    // cached SPS/PPS and feed it whatever arrives next. Recreating the
+    // decoder here is fine -- confirmed by PARAMS_CHANGED below already
+    // doing exactly that uneventfully -- as long as the *previous*
+    // instance was already stopped and released before Settings ever
+    // started covering the screen (see videoTeardownRequested's own field
+    // comment for why that timing specifically matters, confirmed via
+    // logcat on a real device).
     FAST,
     // Settings closed with a changed stream parameter -- a fresh
     // SET_VIDEO_PARAMETERS is needed, and the box may now be sending a
@@ -2386,6 +2716,21 @@ private class PtsMatcher {
  * frame actually audible can only ever be a buffer's depth behind the most
  * recently *written* chunk, never seconds, so there's no need to keep more
  * than a couple of seconds of chunks around.
+ *
+ * reset() must only ever be called when a brand new AudioTrack instance is
+ * about to exist (PlayerActivity's own per-session reset) -- never merely
+ * because the existing track was flush()'d. AudioTrack.flush() does not
+ * reset the frame-position counter getTimestamp() reports (nor
+ * getPlaybackHeadPosition() before it): per Android's own documented
+ * semantics, that counter is cumulative frames actually played since the
+ * track was created, and flush() only discards queued-but-unplayed data --
+ * it keeps counting from wherever it already was regardless. Resetting
+ * this tracker's own bookkeeping to 0 on a flush() while the real counter
+ * keeps its true, large value produces exactly the huge, bogus offset
+ * jumps confirmed in practice (+150s, +300s): every later
+ * estimatePtsAtFrame() call matches the device's real position against
+ * entries that all start back near frame 0, extrapolating a wildly
+ * inflated result.
  */
 private class AudioPositionTracker {
     private class Entry(val frameStart: Long, val ptsStartMs: Long)
@@ -2645,6 +2990,17 @@ private class MediaPacer(
     // submits first in a session (or the first after reset()), then reused
     // for every later item from both streams -- see submit().
     @Volatile private var offsetUs: Long? = null
+    // Slow drift correction applied only to video's own schedule (see
+    // submit()), on top of the shared offsetUs both streams otherwise use
+    // identically. Owned and nudged from outside this class (PlayerActivity's
+    // debugTick, which already has the real measured A/V offset -- see its
+    // own comment) rather than computed in here, since this class
+    // deliberately has no idea AudioTrack or its getTimestamp() exist at
+    // all (see this class's own doc). A plain var, not private: the only
+    // synchronization this needs is the same "eventually visible to the
+    // one thread that reads it in submit()" guarantee @Volatile already
+    // gives every other cross-thread field here.
+    @Volatile var videoScheduleCorrectionUs: Long = 0
     // Set by fastDrainBuffer() (see doResync()) to dispatch every currently-
     // queued item back-to-back, skipping the normal pacing wait, until the
     // queue empties -- recovers the buffer cushion's added latency quickly
@@ -2722,7 +3078,11 @@ private class MediaPacer(
             offset = nowUs() + cushionUs - boxTimeMs * 1000
             offsetUs = offset
         }
-        val pts = boxTimeMs * 1000 + offset
+        // videoScheduleCorrectionUs nudges video only, not audio -- see its
+        // own field comment. Subtracted (not added): a positive correction
+        // means video has been measured running behind, so it needs to
+        // dispatch *sooner* (a smaller ptsUs) to catch back up.
+        val pts = boxTimeMs * 1000 + offset - (if (isVideo) videoScheduleCorrectionUs else 0L)
         queue.add(QueuedItem(pts, seq, isVideo, isKeyFrame, data))
         val oldestQueuedPts = queue.peek()?.ptsUs
         // Subtracts the deliberate cushion before comparing to the
@@ -2744,6 +3104,11 @@ private class MediaPacer(
         queue.clear()
         backlogSignaled = false
         offsetUs = null
+        // A resync's own cause (or the resync itself) could easily be
+        // exactly what the correction was reacting to -- start the drift
+        // estimate over cleanly rather than carry a now-stale value into a
+        // freshly re-anchored schedule.
+        videoScheduleCorrectionUs = 0
     }
 
     /**

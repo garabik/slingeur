@@ -163,7 +163,7 @@
                 android:layout_marginEnd="16dp" android:columnCount="3" android:rowCount="4">
 
                 <Button style="@style/IrButtonRed" android:layout_row="0" android:layout_column="0"
-                    android:tag="1" android:text="⊗" android:textSize="22sp" />
+                    android:tag="1" android:text="PWR" android:textColor="#FF5555" android:textSize="13sp" />
                 <Space android:layout_width="56dp" android:layout_height="56dp" android:layout_row="0" android:layout_column="1" />
                 <Button style="@style/IrButton" android:layout_row="0" android:layout_column="2"
                     android:tag="8" android:text="MUTE" android:textSize="12sp" />

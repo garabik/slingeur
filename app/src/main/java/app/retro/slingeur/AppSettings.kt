@@ -162,6 +162,7 @@ object AppSettings {
     private const val KEY_DEBUG_MESSAGES_ENABLED = "debugMessagesEnabled"
     private const val KEY_DISPLAY_TIME_ENABLED = "displayTimeEnabled"
     private const val KEY_KEEP_SCREEN_ON_ENABLED = "keepScreenOnEnabled"
+    private const val KEY_FAST_VIDEO_RELAUNCH_ENABLED = "fastVideoRelaunchEnabled"
 
     private fun prefs(context: Context): SharedPreferences =
         context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -193,7 +194,24 @@ object AppSettings {
         // applyKeepScreenOn(). On by default: this app is normally watched
         // hands-off for a while, so the system's own idle timeout locking
         // the screen mid-playback is the more surprising default.
-        val keepScreenOnEnabled: Boolean
+        val keepScreenOnEnabled: Boolean,
+        // Settings' own "nothing changed" resume path (see
+        // PlayerActivity.resumeVideoForSettings, VideoResumeMode.FAST):
+        // restarts the decoder instantly using the cached SPS/PPS, with no
+        // requirement that the first frame fed to it afterward be a real
+        // key frame -- a delta frame decoded with no reference picture
+        // available is expected to just look corrupted for a few frames
+        // until the next real key frame arrives. Off by default: confirmed
+        // in practice that at least one real device's hardware decoder can
+        // get stuck this way instead of self-correcting at the next key
+        // frame as expected, leaving video frozen (growing A/V offset, no
+        // picture) for the rest of that session -- recoverable only by
+        // restarting the app, not a crash or a wedge of the decoder
+        // itself. Off means Settings' resume always waits for a genuine
+        // key frame instead (the same path used when nothing was cached
+        // yet), at the cost of a few extra seconds of black screen after
+        // closing Settings.
+        val fastVideoRelaunchEnabled: Boolean
     )
 
     fun load(context: Context): Snapshot {
@@ -219,7 +237,8 @@ object AppSettings {
             fullscreenEnabled = p.getBoolean(KEY_FULLSCREEN_ENABLED, true),
             debugMessagesEnabled = p.getBoolean(KEY_DEBUG_MESSAGES_ENABLED, false),
             displayTimeEnabled = p.getBoolean(KEY_DISPLAY_TIME_ENABLED, true),
-            keepScreenOnEnabled = p.getBoolean(KEY_KEEP_SCREEN_ON_ENABLED, true)
+            keepScreenOnEnabled = p.getBoolean(KEY_KEEP_SCREEN_ON_ENABLED, true),
+            fastVideoRelaunchEnabled = p.getBoolean(KEY_FAST_VIDEO_RELAUNCH_ENABLED, false)
         )
     }
 
@@ -239,6 +258,7 @@ object AppSettings {
             .putBoolean(KEY_DEBUG_MESSAGES_ENABLED, s.debugMessagesEnabled)
             .putBoolean(KEY_DISPLAY_TIME_ENABLED, s.displayTimeEnabled)
             .putBoolean(KEY_KEEP_SCREEN_ON_ENABLED, s.keepScreenOnEnabled)
+            .putBoolean(KEY_FAST_VIDEO_RELAUNCH_ENABLED, s.fastVideoRelaunchEnabled)
             .apply()
     }
 
