@@ -132,5 +132,5 @@ Some of the settings explained:
 * **Video decoder**: use Auto or Hardware, unless you have problems
 * **Buffer size**: size of playback buffer, in video frames. Set to 0 for low latency and very stable network connection; a small number (2 or 3) is recommended.
 * **Pace video to real time**: keep enabled, unless you want the lowest possible latency. If disabled, the frames are played as soon as they arrive, which results in stuttering and audio/video desync.
-* **Low latency mode**: instruct Android decoder to use low-latency mode, if available. Keep on, unless you have audio/video sync or other problems.
-
+* **Low latency mode**: instruct Android decoder to use low-latency mode, if available. Keep On, unless you have audio/video sync or other problems.
+* **Fast video resume**: if on, resume video immediately upon returning from the Settings (will be glitched until a next Key frame). Otherwise, keep playing just the audio until the next Key frame. Some cheap chipsets crash when checked; if this works for you, keep On.
